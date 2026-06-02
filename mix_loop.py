@@ -220,6 +220,24 @@ def get_track_names():
     return tracks
 
 
+
+# ─── Device cache (avoids redundant get_track_info calls) ───
+_track_cache = {}  # track_idx -> {"name": str, "devices": [{"index": int, "name": str}]}
+
+
+def _get_track_devices(ti):
+    """Get device list for a track, cached after first call."""
+    if ti in _track_cache:
+        return _track_cache[ti]["devices"]
+    t = lp_call("get_track_info", {"track_index": ti}, timeout=4)
+    if not t.get("ok"):
+        return []
+    devices = [{"index": di, "name": dev.get("name", "")}
+               for di, dev in enumerate(t["result"].get("devices", []))]
+    _track_cache[ti] = {"name": t["result"].get("name", "?"), "devices": devices}
+    return devices
+
+
 def resolve_and_apply(band_issues, track_names, iteration=0, peak_db=None):
     """One-iteration lean loop: find biggest deviation, resolve target with targeted
     LivePilot calls, apply ONE fix. No bulk scan."""
@@ -246,15 +264,14 @@ def resolve_and_apply(band_issues, track_names, iteration=0, peak_db=None):
         # Untagged fallback: any track
         candidates = [t for t in track_names if not t.get("mute")]
 
-    # 2. Query device info on candidates until we find a matching device
+    # 2. Find device on candidates (cached — only queries each track once ever)
     match = None
-    for cand in candidates[:5]:  # check first 5 candidates max
+    for cand in candidates[:5]:
         ti = cand["index"]
-        t = lp_call("get_track_info", {"track_index": ti}, timeout=4)
-        if not t.get("ok"): continue
-        for di, dev in enumerate(t["result"].get("devices", [])):
-            if any(dt.lower() in dev.get("name","").lower() for dt in fix["devices"]):
-                match = (ti, di, dev["name"], cand["name"])
+        devices = _get_track_devices(ti)
+        for dev in devices:
+            if any(dt.lower() in dev["name"].lower() for dt in fix["devices"]):
+                match = (ti, dev["index"], dev["name"], cand["name"])
                 break
         if match: break
 
@@ -286,7 +303,11 @@ def resolve_and_apply(band_issues, track_names, iteration=0, peak_db=None):
 
     new_val = max(0.0, min(1.0, new_val))
 
-    # 4. Apply (ONE write)
+    # 4. Skip write if value unchanged (floor/ceiling hit)
+    if abs(new_val - current) < 0.001:
+        return [f"Iter[{iteration}]: SKIP {dname}({tname}) {pname}: already at {current:.3f}"]
+
+    # 5. Apply (ONE write)
     r = lp_call("set_device_parameter", {"track_index": ti, "device_index": di, "parameter_index": pidx, "value": new_val})
     status = "OK" if r.get("ok") else "FAIL"
 
