@@ -132,6 +132,7 @@ def scan_session(fast=True, force=False):
         if age < 300:
             return cached
 
+    # Try the new batched command first (LivePilot with get_all_device_parameters patch)
     session = lp_call("get_session_info", timeout=5)
     if not session.get("ok"):
         if os.path.exists(SCAN_CACHE):
@@ -139,42 +140,64 @@ def scan_session(fast=True, force=False):
         return None
 
     info = session["result"]
-    track_count = info.get("track_count", 0)
     start = time.time()
     devices = []
 
-    for ti in range(track_count):
-        t = lp_call("get_track_info", {"track_index": ti}, timeout=4)
-        if not t.get("ok"): continue
-        tr = t["result"]
-        track_name = tr.get("name", f"Track_{ti}")
-        track_muted = tr.get("mute", False)
-        dev_list = tr.get("devices", [])
-
-        has_interesting = any(
-            any(idt.lower() in d.get("name", "").lower() for idt in DEVICE_TYPES)
-            for d in dev_list
-        )
-        if not has_interesting: continue
-
-        for di, dev in enumerate(dev_list):
-            dev_name = dev.get("name", f"dev_{di}")
-            if not any(idt.lower() in dev_name.lower() for idt in DEVICE_TYPES):
-                continue
-            entry = {
-                "track_idx": ti, "device_idx": di,
-                "track_name": track_name, "track_muted": track_muted,
-                "device_name": dev_name,
-            }
-            if not fast:
-                entry["params"] = fetch_device_params(ti, di)
-            devices.append(entry)
+    # Fast path: use get_all_device_parameters if available (1 call vs 30+)
+    batch = lp_call("get_all_device_parameters", timeout=20)
+    if batch.get("ok"):
+        for track in batch["result"].get("tracks", []):
+            ti = track["track_index"]
+            track_name = track["track_name"]
+            track_muted = track.get("mute", False)
+            for dev in track.get("devices", []):
+                entry = {
+                    "track_idx": ti, "device_idx": dev["index"],
+                    "track_name": track_name, "track_muted": track_muted,
+                    "device_name": dev["name"],
+                }
+                if not fast:
+                    # Params already included in batch response
+                    params = {}
+                    for p in dev.get("parameters", []):
+                        pname = p.get("name", "").lower()
+                        params[pname] = {"index": p["index"], "value": p["value"]}
+                    entry["params"] = params
+                devices.append(entry)
+    else:
+        # Fallback: per-track calls (slow)
+        track_count = info.get("track_count", 0)
+        for ti in range(track_count):
+            t = lp_call("get_track_info", {"track_index": ti}, timeout=4)
+            if not t.get("ok"): continue
+            tr = t["result"]
+            track_name = tr.get("name", f"Track_{ti}")
+            track_muted = tr.get("mute", False)
+            dev_list = tr.get("devices", [])
+            has_interesting = any(
+                any(idt.lower() in d.get("name", "").lower() for idt in DEVICE_TYPES)
+                for d in dev_list
+            )
+            if not has_interesting: continue
+            for di, dev in enumerate(dev_list):
+                dev_name = dev.get("name", f"dev_{di}")
+                if not any(idt.lower() in dev_name.lower() for idt in DEVICE_TYPES):
+                    continue
+                entry = {
+                    "track_idx": ti, "device_idx": di,
+                    "track_name": track_name, "track_muted": track_muted,
+                    "device_name": dev_name,
+                }
+                if not fast:
+                    entry["params"] = fetch_device_params(ti, di)
+                devices.append(entry)
 
     elapsed = time.time() - start
-    result = {"devices": devices, "track_count": track_count, "tempo": info.get("tempo"), "_ts": time.time()}
+    result = {"devices": devices, "track_count": info.get("track_count"), "tempo": info.get("tempo"), "_ts": time.time()}
     os.makedirs(os.path.dirname(SCAN_CACHE), exist_ok=True)
     with open(SCAN_CACHE, "w") as f:
         json.dump(result, f)
+    print(f"  Scanned {len(devices)} devices in {elapsed:.1f}s", file=sys.stderr)
     return result
 
 
