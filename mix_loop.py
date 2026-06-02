@@ -105,6 +105,84 @@ def capture_blackhole(duration=6):
     return output_path
 
 
+def validate_audio_signal(analysis):
+    """Check if capture contains actual audio (not silence).
+    Returns (ok: bool, message: str).
+    Call before proceeding with fix/loop to prevent running against silence."""
+    if not analysis:
+        return False, "Analysis failed — cannot validate audio."
+
+    rms = analysis.get("rms_db", -200)
+    peak = analysis.get("peak_db", -200)
+    lufs = analysis.get("lufs_integrated")
+
+    if rms < -80:
+        return False, (
+            "No audio detected. Check:\n"
+            "  1. Ableton Preferences → Audio → Output Device = BlackHole 2ch\n"
+            "  2. Playback is running (press space in Ableton)\n"
+            "  3. Master channel is not muted\n"
+            "  4. Tracks are not all muted"
+        )
+
+    if rms < -35:
+        return True, (
+            f"Audio is very quiet (RMS {rms:.1f} dB, peak {peak:.1f} dB).\n"
+            "Check Ableton master fader and track volumes."
+        )
+
+    if peak > -0.3:
+        return True, (
+            f"WARNING: Peak at {peak:.1f} dBFS — near clipping.\n"
+            "Loop will block gain increases (red-line protection active)."
+        )
+
+    if peak >= 0.0:
+        return True, (
+            f"WARNING: Audio is clipping (peak {peak:.1f} dBFS).\n"
+            "Reduce master level or track volumes. Loop will block all gain increases."
+        )
+
+    return True, f"Audio OK — RMS {rms:.1f} dB, peak {peak:.1f} dB, LUFS {lufs}"
+
+
+def check_playback_state():
+    """Check if Ableton is playing. Returns (playing: bool, message: str)."""
+    r = lp_call("get_session_info", timeout=3)
+    if not r.get("ok"):
+        return None, "Cannot reach LivePilot to check playback state."
+    is_playing = r["result"].get("is_playing", False)
+    if is_playing:
+        return True, "Playback is running."
+    else:
+        return False, "Playback is STOPPED. Press space in Ableton to start."
+
+
+def preflight_check(capture_duration=2):
+    """Run pre-flight validation before fix/loop.
+    Returns (ok: bool, analysis: dict or None, message: str)."""
+    # 1. Check playback
+    playing, play_msg = check_playback_state()
+    print(f"  Playback: {play_msg}", file=sys.stderr)
+    if playing is False:
+        return False, None, play_msg
+
+    # 2. Quick capture
+    print(f"  Capturing {capture_duration}s to validate audio routing...", file=sys.stderr)
+    audio_path = capture_blackhole(capture_duration)
+
+    # 3. Analyze
+    analysis = analyze_file(audio_path)
+    os.unlink(audio_path)
+
+    if not analysis:
+        return False, None, "Audio analysis failed — check BlackHole and ffmpeg."
+
+    # 4. Validate signal
+    ok, msg = validate_audio_signal(analysis)
+    return ok, analysis, msg
+
+
 def analyze_file(filepath):
     r = subprocess.run(
         [PYTHON, ANALYZER, "analyze", filepath],
@@ -555,6 +633,105 @@ def apply_smart(session_devices, recommendations, iteration=0, peak_db=None):
     return [summary] + results
 
 
+# ─── Greedy single-shot optimization ───
+# Instead of applying 7+ recommendations that fight each other,
+# find the SINGLE biggest band deviation and apply ONE fix per iteration.
+# This eliminates oscillation and reduces LivePilot calls from 7×3s to 1×3s.
+
+def find_biggest_deviation(band_issues):
+    """From per-band issues, return the single biggest deviation.
+    Returns (band_name, direction, sigmas) or None if all within deadband."""
+    if not band_issues:
+        return None
+    significant = [b for b in band_issues if b.get("sigmas", 0) > 0.8]
+    if not significant:
+        return None
+    biggest = max(significant, key=lambda b: b["sigmas"])
+    return (biggest["band"], biggest["direction"], biggest["sigmas"])
+
+
+def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
+    """Find the biggest band deviation and apply ONE parameter fix.
+    Returns [summary_line, result_line] or [summary_line] if nothing to fix."""
+    biggest = find_biggest_deviation(band_issues)
+    if not biggest:
+        return [f"Iter[{iteration}]: All bands within deadband — nothing to fix"]
+
+    band, direction, sigmas = biggest
+    prop_factor = PROPORTIONAL_GAIN / (1 + iteration * 0.3)
+    redline_active = peak_db is not None and peak_db > REDLINE_PEAK_DB
+
+    # Map band → recommendation text for device matching
+    band_to_rec = {
+        "sub": "sub frequencies" if direction == "weak" else "sub is hot",
+        "bass": "bass (60-120hz) is weak" if direction == "weak" else "bass (60-120hz) is hot",
+        "low_mid": "low-mids are thin" if direction == "weak" else "low-mids are muddy",
+        "mid": "mid range is weak" if direction == "weak" else "mid range is hot",
+        "high_mid": "high-mids are weak" if direction == "weak" else "high-mids are hot",
+        "presence": "presence is dull" if direction == "weak" else "presence is harsh",
+        "air": "air is missing" if direction == "weak" else "air is harsh",
+    }
+    rec_text = band_to_rec.get(band)
+    if not rec_text:
+        return [f"Iter[{iteration}]: Unknown band '{band}' — cannot fix"]
+
+    # Find matching recommendation and first fix action
+    fix = None
+    for smart in SMART_RECOMMENDATIONS:
+        if any(m.lower() in rec_text.lower() for m in smart["match"]):
+            fix = smart["fix"][0]  # greedy: first fix action only
+            break
+
+    if not fix:
+        return [f"Iter[{iteration}]: No fix mapping for '{rec_text}'"]
+
+    # Find device — role-targeted
+    match = find_device(session_devices, fix["devices"], rec_text=rec_text)
+    if not match:
+        return [f"Iter[{iteration}]: No device found for '{rec_text}'"]
+
+    ti, di, dname, tname = match
+    params = fetch_device_params(ti, di)
+    p_match = find_param_in_device(params, fix["params"])
+    if not p_match:
+        return [f"Iter[{iteration}]: No matching param on {dname}({tname})"]
+
+    pname, pidx, current = p_match
+    delta = fix["delta_base"] * prop_factor * min(1.0, sigmas / 3.0)
+
+    # Red-line
+    if delta > 0 and redline_active:
+        return [f"Iter[{iteration}]: BLOCKED — redline ({peak_db:.1f} dBFS)"]
+
+    new_val = current + delta
+
+    # Ceiling
+    ck = fix.get("ceiling")
+    if ck and delta > 0 and current >= GAIN_CEILINGS.get(ck, 1.0):
+        return [f"Iter[{iteration}]: AT-CEIL[{ti}] {dname}({tname}) {pname}: {current:.3f}"]
+
+    if ck and delta < 0:
+        new_val = max(new_val, GAIN_FLOORS.get(ck, 0.0))
+
+    # Deadband
+    if abs(delta) < 0.005:
+        return [f"Iter[{iteration}]: Deadband — {band} delta too small ({delta:+.4f})"]
+
+    new_val = max(0.0, min(1.0, new_val))
+
+    r = lp_call("set_device_parameter", {
+        "track_index": ti, "device_index": di,
+        "parameter_index": pidx, "value": new_val,
+    })
+
+    status = "OK" if r.get("ok") else "FAIL"
+    return [
+        f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → "
+        f"{dname}({tname}) {pname}: {current:.3f}→{new_val:.3f} "
+        f"(Δ{delta:+.3f})",
+    ]
+
+
 # ─── Loop mode ───
 
 def load_history():
@@ -570,7 +747,7 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 
-def run_loop(iterations=5, duration=6):
+def run_loop(iterations=5, duration=4):
     """Run capture→analyze→apply loop with convergence tracking."""
     history = load_history()
     if not history.get("started"):
@@ -650,10 +827,13 @@ def run_loop(iterations=5, duration=6):
                 os.unlink(audio_path)
                 break
 
+            # Get band issues from comparison for greedy targeting
+            band_issues = comparison.get("band_issues", [])
+            
             print(f"  Found {len(session['devices'])} devices across {session['track_count']} tracks", file=sys.stderr)
 
-            print(f"  Applying adjustments (prop_factor={prop_factor:.2f})...", file=sys.stderr)
-            applied = apply_smart(session["devices"], recs, i, peak)
+            print(f"  Greedy single-shot...", file=sys.stderr)
+            applied = apply_greedy(session["devices"], band_issues, i, peak)
             report["applied"] = applied
             for line in applied:
                 print(f"    {line}", file=sys.stderr)
@@ -711,7 +891,7 @@ def main():
         os.unlink(audio_path)
 
     elif cmd == "fix":
-        duration = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+        duration = int(sys.argv[2]) if len(sys.argv) > 2 else 4
         print(f"Capturing {duration}s from BlackHole...", file=sys.stderr)
         audio_path = capture_blackhole(duration)
 
@@ -721,8 +901,14 @@ def main():
             sys.exit(1)
 
         analysis = comparison.get("analysis", {})
+        band_issues = comparison.get("band_issues", [])
         recs = comparison.get("recommendations", [])
         peak = analysis.get("peak_db")
+
+        # Quick silence check (NASA Rule 7: check every return)
+        if analysis.get("rms_db", -200) < -80:
+            print("ERROR: No audio detected. Check BlackHole routing and playback.", file=sys.stderr)
+            sys.exit(1)
 
         print(f"Peak: {peak:.1f} dBFS", file=sys.stderr)
         print(f"Recommendations ({len(recs)}):", file=sys.stderr)
@@ -734,7 +920,7 @@ def main():
             session = scan_session(fast=True)
             if session:
                 print(f"Found {len(session['devices'])} devices on {session['track_count']} tracks", file=sys.stderr)
-                results = apply_smart(session["devices"], recs, 0, peak)
+                results = apply_greedy(session["devices"], band_issues, 0, peak)
             else:
                 results = ["ERROR: LivePilot not connected"]
             print(json.dumps({
@@ -748,7 +934,7 @@ def main():
     elif cmd == "loop":
         iterations = int(sys.argv[2]) if len(sys.argv) > 2 else 5
         iterations = min(iterations, MAX_ITERATIONS)
-        duration = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+        duration = int(sys.argv[3]) if len(sys.argv) > 3 else 4
         print(run_loop(iterations, duration))
 
     elif cmd == "analyze":
