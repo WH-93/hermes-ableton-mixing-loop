@@ -291,25 +291,34 @@ class SpectralReceiver(threading.Thread):
 # ═══════════════════════════════════════════
 
 class BridgeSender:
-    """Sends UDP commands to the M4L bridge (port 9881). Fire-and-forget —
-    no response read needed; the spectral stream confirms results.
-    """
+    """Parameter writer. Uses TCP (LivePilot) since bridge set_param
+    is unreliable — bridge is only used for spectral streaming."""
 
     def __init__(self):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        pass
 
     def set_param(self, track_idx, device_idx, param_idx, value):
-        """Send set_param OSC command. No response read — returns immediately."""
-        cmd = b'set_param\x00\x00\x00'
-        types = b',iiif\x00'
-        args = struct.pack('>iiif', track_idx, device_idx, param_idx, float(value))
-        self._sock.sendto(cmd + types + args, ('127.0.0.1', BRIDGE_TX))
-
-    def close(self):
+        """Set parameter via LivePilot TCP."""
         try:
-            self._sock.close()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(('127.0.0.1', 9878))
+            s.sendall(json.dumps({'id':'bp','type':'set_device_parameter',
+                'params':{'track_index':track_idx,'device_index':device_idx,
+                          'parameter_index':param_idx,'value':value}}).encode()+b'\n')
+            r = b''
+            while True:
+                try:
+                    c = s.recv(65536)
+                    if not c: break
+                    r += c
+                except: break
+            s.close()
         except Exception:
             pass
+
+    def close(self):
+        pass
 
 
 # ═══════════════════════════════════════════
@@ -527,26 +536,32 @@ def get_resonance_index(ti, di, gain_param_name):
 _last_validation_deviation = None  # (band, direction, sigmas) from last BlackHole check
 _last_validation_spectral = None   # bridge spectral at time of validation
 _stuck_counter = 0                 # consecutive iterations on same band+direction
-_stuck_band = None                 # band+direction we're stuck on
+_stuck_band = None                 # band+direction combination we're tracking
+_dead_fix_indices = set()          # fix indices at ceiling/floor — skip permanently this cycle
 MAX_STUCK_ITERATIONS = 5           # escalate after this many stuck iterations
 
 
 def set_validation_ground_truth(comparison_result, current_spectral=None):
     """Called after each BlackHole validation to set the ground truth target."""
-    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _stuck_band
+    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _stuck_band, _dead_fix_indices
     if not comparison_result or 'error' in comparison_result:
         return
     band_issues = comparison_result.get('band_issues', [])
     new_deviation = find_biggest_deviation(band_issues)
 
-    # Check if we made progress since last validation
+    # Reset dead fix tracking when band changes
+    if (not _last_validation_deviation or
+        _last_validation_deviation[:2] != new_deviation[:2]):
+        _dead_fix_indices.clear()
+        _stuck_counter = 0
+
+    # Track improvement/worsening for diagnostics only
     if _last_validation_deviation and new_deviation:
         old_band, old_dir, old_sigmas = _last_validation_deviation
         new_band, new_dir, new_sigmas = new_deviation
         if old_band == new_band and old_dir == new_dir:
             if new_sigmas < old_sigmas:
                 print(f"     ✓ improved: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
-                _stuck_counter = 0
             elif new_sigmas >= old_sigmas * 1.1:
                 print(f"     ✗ worse: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
                 _stuck_counter += 1
@@ -594,7 +609,7 @@ def checkpoint_spectral(spectral):
 # ═══════════════════════════════════════════
 
 def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
-    global _last_validation_deviation, _last_validation_spectral, _stuck_counter
+    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _dead_fix_indices
     profile_path = profile_path or PROFILE
 
     print("═" * 60)
@@ -698,8 +713,14 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
             stuck_label = f" [STUCK x{_stuck_counter}]" if _stuck_counter >= MAX_STUCK_ITERATIONS else ""
             print(f"[{i+1:3d}] 🚀 {target_band:10s} {target_direction:4s} ({target_sigmas:.0f}σ) aggressive{stuck_label}  ({time.time()-t0:.3f}s)")
 
-            # If stuck, try second fix action or different track
-            fix_idx = 1 if _stuck_counter >= MAX_STUCK_ITERATIONS else 0
+            # If stuck, try next fix action or different track — skip dead indices
+            fix_idx = 0
+            while fix_idx in _dead_fix_indices:
+                fix_idx += 1
+            if _stuck_counter >= MAX_STUCK_ITERATIONS:
+                fix_idx = max(fix_idx, 1)  # at least try fix #1 when stuck
+                while fix_idx in _dead_fix_indices:
+                    fix_idx += 1
             fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i, fix_idx=fix_idx)
             if fix:
                 # If stuck, try next candidate track
@@ -753,6 +774,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                         # Detect ceiling/floor hit
                         if abs(new_val - current_val) < 0.001:
                             print(f"     ⚠ {dname}({tname}) {pname} at limit ({current_val:.2f}) — stuck")
+                            _dead_fix_indices.add(fix_idx)  # permanently skip this fix
                             _stuck_counter += 1
                         else:
                             bridge.set_param(ti, di, pidx, new_val)
