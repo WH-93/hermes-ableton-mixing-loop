@@ -1,0 +1,461 @@
+"""
+LivePilot - TCP server with thread-safe command queue.
+
+Runs a background daemon thread that accepts JSON-over-TCP connections.
+Commands are forwarded to Ableton's main thread via schedule_message,
+and responses are returned through per-command Queue objects.
+"""
+
+import socket
+import threading
+import json
+
+import queue
+
+from . import router
+
+# ── Commands that modify Live state (need settle delay) ──────────────────────
+
+# Parameter changes are instantaneous — no settle delay needed
+FAST_WRITE_COMMANDS = frozenset([
+    "set_device_parameter", "batch_set_parameters",
+    "set_track_volume", "set_track_pan", "set_track_send",
+    "set_master_volume", "set_track_routing",
+])
+
+WRITE_COMMANDS = frozenset([
+    # transport
+    "set_tempo", "set_time_signature", "start_playback", "stop_playback",
+    "continue_playback", "toggle_metronome", "set_session_loop", "undo", "redo",
+    # tracks
+    "create_midi_track", "create_audio_track", "create_return_track",
+    "delete_track", "duplicate_track", "set_track_name", "set_track_color",
+    "set_track_mute", "set_track_solo", "set_track_arm", "stop_track_clips",
+    "set_group_fold", "set_track_input_monitoring",
+    # clips
+    "create_clip", "delete_clip", "duplicate_clip", "fire_clip", "stop_clip",
+    "set_clip_name", "set_clip_color", "set_clip_loop", "set_clip_launch",
+    "set_clip_warp_mode",
+    # notes
+    "add_notes", "remove_notes", "remove_notes_by_id", "modify_notes",
+    "duplicate_notes", "transpose_notes", "quantize_clip",
+    # devices
+    "set_device_parameter", "batch_set_parameters", "toggle_device",
+    "delete_device", "load_device_by_uri", "find_and_load_device",
+    "set_chain_volume", "set_simpler_playback_mode",
+    # scenes
+    "create_scene", "delete_scene", "duplicate_scene", "fire_scene",
+    "set_scene_name", "set_scene_color", "set_scene_tempo",
+    "fire_scene_clips", "stop_all_clips",
+    # tracks (freeze/flatten)
+    "freeze_track", "flatten_track",
+    # mixing
+    "set_track_volume", "set_track_pan", "set_track_send",
+    "set_master_volume", "set_track_routing",
+    # browser
+    "load_browser_item",
+    # arrangement
+    "jump_to_time", "jump_to_cue", "capture_midi", "start_recording",
+    "stop_recording", "toggle_cue_point", "back_to_arranger",
+    "create_arrangement_clip", "add_arrangement_notes",
+    "remove_arrangement_notes", "remove_arrangement_notes_by_id",
+    "modify_arrangement_notes", "duplicate_arrangement_notes",
+    "transpose_arrangement_notes", "set_arrangement_automation",
+    "set_arrangement_clip_name",
+    # clip automation
+    "set_clip_automation",
+    "clear_clip_automation",
+])
+
+# Future-safe write detection. WRITE_COMMANDS remains the explicit allow-list
+# for older handlers and readability; the prefix classifier catches newer
+# mutating handlers so they still receive the write timeout and settle delay.
+READ_COMMAND_PREFIXES = ("get_", "list_", "scan_")
+READ_ONLY_COMMANDS = frozenset([
+    "ping",
+    "reload_handlers",
+])
+WRITE_COMMAND_PREFIXES = (
+    "add_",
+    "apply_",
+    "arrangement_automation_",
+    "assign_",
+    "back_to_",
+    "capture_",
+    "cleanup_",
+    "clear_",
+    "continue_",
+    "copy_",
+    "create_",
+    "delete_",
+    "duplicate_",
+    "find_and_load_",
+    "fire_",
+    "flatten_",
+    "force_",
+    "freeze_",
+    "import_",
+    "insert_",
+    "jump_",
+    "load_",
+    "modify_",
+    "move_",
+    "nudge_",
+    "quantize_",
+    "randomize_",
+    "recall_",
+    "remove_",
+    "replace_",
+    "reset_",
+    "set_",
+    "start_",
+    "stop_",
+    "store_",
+    "tap_",
+    "toggle_",
+    "transpose_",
+)
+
+
+def is_write_command(command_type):
+    """Return True if a command is expected to mutate Live state."""
+    if command_type in WRITE_COMMANDS:
+        return True
+    if command_type in READ_ONLY_COMMANDS:
+        return False
+    if command_type.startswith(READ_COMMAND_PREFIXES):
+        return False
+    return command_type.startswith(WRITE_COMMAND_PREFIXES)
+
+
+# Commands that need longer timeouts (e.g., freeze renders audio)
+SLOW_WRITE_COMMANDS = frozenset([
+    "freeze_track",
+])
+
+
+class LivePilotServer(object):
+    """TCP server that bridges JSON commands to Ableton's main thread.
+
+    Single-client by design: only one client can be connected at a time.
+    All commands must execute on Ableton's main thread (Live Object Model
+    is not thread-safe), so serialized client access prevents race conditions.
+    Additional connection attempts are rejected with a clear error message.
+    """
+
+    def __init__(self, control_surface, host="127.0.0.1", port=9878):
+        self._cs = control_surface
+        self._host = host
+        self._port = port
+        self._running = False
+        self._server_socket = None
+        self._thread = None
+        self._client_thread = None
+        self._command_queue = queue.Queue()
+        self._client_lock = threading.Lock()
+        self._client_connected = False
+        # Track the active client socket so we can close it from the accept
+        # loop when a new connection arrives. See _server_loop's kick-stale
+        # flow — without this, an unclean MCP-server restart leaves the
+        # Remote Script in a state where new connections get rejected until
+        # the old socket times out (often requiring an Ableton restart).
+        self._current_client = None
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def start(self):
+        """Start the background listener thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._server_loop)
+        self._thread.daemon = True
+        self._thread.start()
+        # Note: "Listening on ..." is logged from _server_loop after bind
+        # succeeds. Don't log "Server started" here — bind may still fail.
+
+    def stop(self):
+        """Shutdown the server gracefully."""
+        self._running = False
+        if self._server_socket:
+            try:
+                self._server_socket.close()
+            except OSError:
+                pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        if self._client_thread and self._client_thread.is_alive():
+            self._client_thread.join(timeout=3)
+        self._log("Server stopped")
+
+    # ── Logging ──────────────────────────────────────────────────────────
+
+    def _log(self, message):
+        try:
+            self._cs.log_message("[LivePilot] " + str(message))
+        except Exception:
+            pass
+
+    # ── Background thread ────────────────────────────────────────────────
+
+    def _server_loop(self):
+        """Runs in a daemon thread.  Accepts one client at a time."""
+        try:
+            self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._server_socket.bind((self._host, self._port))
+            self._server_socket.listen(2)
+            self._server_socket.settimeout(1.0)
+            self._log("Listening on %s:%d" % (self._host, self._port))
+        except OSError as exc:
+            self._log("Failed to bind: %s" % exc)
+            return
+
+        while self._running:
+            try:
+                client, addr = self._server_socket.accept()
+                # Single-client design: a new connection means the previous one
+                # is dead. Close the stale socket and join its thread (outside
+                # the lock so the thread's finally block can acquire it), then
+                # accept the new connection. Without this, the server could
+                # reject reconnections for up to 1s after an unclean MCP-server
+                # restart — the old recv() loop hadn't yet observed EOF.
+                stale_thread = None
+                stale_client = None
+                with self._client_lock:
+                    if self._client_connected and self._current_client is not None:
+                        stale_client = self._current_client
+                        stale_thread = self._client_thread
+                        self._log(
+                            "Replacing stale client with new connection from %s:%d" % addr
+                        )
+                if stale_client is not None:
+                    try:
+                        stale_client.close()
+                    except OSError:
+                        pass
+                if stale_thread is not None and stale_thread.is_alive():
+                    # 2s is generous — the old recv() unblocks the moment we
+                    # close the socket above, then the thread's finally block
+                    # acquires the lock, resets _client_connected, and exits.
+                    stale_thread.join(timeout=2)
+
+                with self._client_lock:
+                    self._client_connected = True
+                    self._current_client = client
+                    self._client_thread = threading.Thread(
+                        target=self._run_client_session,
+                        args=(client, addr),
+                    )
+                    self._client_thread.daemon = True
+                    self._client_thread.start()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._running:
+                    self._log("Accept error")
+                break
+
+        try:
+            self._server_socket.close()
+        except OSError:
+            pass
+
+    def _run_client_session(self, client, addr):
+        """Handle one active client without blocking new connection rejects."""
+        self._log("Client connected from %s:%d" % addr)
+        try:
+            self._handle_client(client)
+        except OSError as exc:
+            self._log("Client error: %s" % exc)
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
+            with self._client_lock:
+                self._client_connected = False
+                # Only clear _current_client if it still points at us — the
+                # accept loop may have already replaced us with a new client
+                # (in which case _current_client is the new socket).
+                if self._current_client is client:
+                    self._current_client = None
+            self._log("Client disconnected")
+
+    def _handle_client(self, client):
+        """Read newline-delimited JSON from a connected client.
+
+        Accumulate raw bytes and only attempt UTF-8 decode on newline-framed
+        lines — the previous implementation decoded each recv chunk eagerly
+        with ``errors="replace"``, which silently corrupted JSON when a
+        multi-byte UTF-8 sequence (non-ASCII filename or rack name) straddled
+        the 4096-byte recv boundary. Trailing bytes of the split codepoint
+        were converted to U+FFFD, breaking JSON parsing.
+        """
+        client.settimeout(1.0)
+        buf = bytearray()
+        MAX_BUF = 4 * 1024 * 1024  # 4 MB
+        while self._running:
+            try:
+                data = client.recv(4096)
+                if not data:
+                    break
+                buf.extend(data)
+                if len(buf) > MAX_BUF:
+                    self._log("Client buffer overflow — disconnecting")
+                    break
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    raw_line = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    try:
+                        line = raw_line.decode("utf-8").strip()
+                    except UnicodeDecodeError as exc:
+                        self._send(client, {
+                            "id": "unknown",
+                            "ok": False,
+                            "error": {
+                                "code": "INVALID_PARAM",
+                                "message": "Invalid UTF-8 in request: %s" % exc,
+                            },
+                        })
+                        continue
+                    if line:
+                        self._process_line(client, line)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                self._log("Recv error: %s" % exc)
+                break
+
+    def _process_line(self, client, line):
+        """Parse one JSON command, queue it for main thread, wait for result."""
+        try:
+            command = json.loads(line)
+        except (ValueError, TypeError) as exc:
+            resp = {
+                "id": "unknown",
+                "ok": False,
+                "error": {"code": "INVALID_PARAM", "message": "Bad JSON: %s" % exc},
+            }
+            self._send(client, resp)
+            return
+
+        request_id = command.get("id", "unknown")
+        cmd_type = command.get("type", "")
+
+        # Determine timeout based on read vs write vs slow write
+        is_write = is_write_command(cmd_type)
+        if cmd_type in SLOW_WRITE_COMMANDS:
+            timeout = 35
+        elif is_write:
+            timeout = 15
+        else:
+            timeout = 10
+
+        # Per-command response queue
+        response_queue = queue.Queue()
+        self._command_queue.put((command, response_queue))
+
+        # Schedule processing on Ableton's main thread
+        try:
+            self._cs.schedule_message(0, self._process_next_command)
+        except AssertionError:
+            # ControlSurface is disconnecting — return an error instead of
+            # running LOM calls on the TCP thread (which would be unsafe).
+            #
+            # The previous version called get_nowait() unconditionally, which
+            # would happily drain a different item if one had been enqueued
+            # concurrently (e.g. if _drain_queue had just put another). Under
+            # the current single-client model the race is theoretical, but the
+            # filtered-rebuild below is correct regardless and defends against
+            # any future multi-path enqueue.
+            remaining = []
+            while True:
+                try:
+                    item = self._command_queue.get_nowait()
+                except queue.Empty:
+                    break
+                # Drop only OUR own pending item; preserve anything else
+                if item[1] is not response_queue:
+                    remaining.append(item)
+            for item in remaining:
+                self._command_queue.put(item)
+            self._send(client, {
+                "id": request_id,
+                "ok": False,
+                "error": {"code": "STATE_ERROR", "message": "Script is disconnecting"},
+            })
+            return
+
+        # Wait for response from main thread
+        try:
+            resp = response_queue.get(timeout=timeout)
+        except queue.Empty:
+            resp = {
+                "id": request_id,
+                "ok": False,
+                "error": {"code": "TIMEOUT", "message": "Command timed out after %ds" % timeout},
+            }
+
+        self._send(client, resp)
+
+    # ── Main thread execution ────────────────────────────────────────────
+
+    def _process_next_command(self):
+        """Called on Ableton's main thread via schedule_message.
+        Processes one command from the queue."""
+        try:
+            command, response_queue = self._command_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        cmd_type = command.get("type", "")
+        is_write = is_write_command(cmd_type)
+        is_fast_write = cmd_type in FAST_WRITE_COMMANDS
+
+        try:
+            song = self._cs.song()
+            result = router.dispatch(song, command)
+        except Exception as exc:
+            result = {
+                "id": command.get("id", "unknown"),
+                "ok": False,
+                "error": {"code": "INTERNAL", "message": str(exc)},
+            }
+
+        if is_write and not is_fast_write:
+            # Schedule response after 100ms settle delay for write operations
+            def send_response():
+                response_queue.put(result)
+                # Drain any remaining queued commands
+                self._drain_queue()
+            try:
+                self._cs.schedule_message(1, send_response)  # ~100ms
+            except AssertionError:
+                # ControlSurface disconnecting — send result immediately
+                response_queue.put(result)
+        else:
+            response_queue.put(result)
+            # Drain any remaining queued commands
+            self._drain_queue()
+
+    def _drain_queue(self):
+        """Process any remaining commands in the queue."""
+        if not self._command_queue.empty():
+            try:
+                self._cs.schedule_message(0, self._process_next_command)
+            except AssertionError:
+                # ControlSurface disconnecting — drop remaining commands
+                # rather than running LOM calls on the wrong thread
+                pass
+
+    # ── Socket I/O ───────────────────────────────────────────────────────
+
+    def _send(self, client, response):
+        """Send a JSON response to the client."""
+        from .utils import serialize_json
+        try:
+            client.sendall(serialize_json(response).encode("utf-8"))
+        except OSError as exc:
+            self._log("Send error: %s" % exc)

@@ -534,18 +534,30 @@ def main():
             print(f"  {name:12s} — {PRESETS[name]['description']}")
 
     elif cmd == "roles":
-        r = lp_call("get_session_info", timeout=3)
-        if not r.get("ok"):
-            print("ERROR: Cannot reach LivePilot")
-            sys.exit(1)
-        tc = r["result"]["track_count"]
+        # Use fast batched command if available, fallback to per-track
+        batch = lp_call("get_all_track_names", timeout=10)
+        if batch.get("ok"):
+            tracks = batch["result"].get("tracks", [])
+            batch_mode = True
+        else:
+            r = lp_call("get_session_info", timeout=3)
+            if not r.get("ok"):
+                print("ERROR: Cannot reach LivePilot")
+                sys.exit(1)
+            tc = r["result"]["track_count"]
+            tracks = []
+            for ti in range(tc):
+                t = lp_call("get_track_info", {"track_index": ti}, timeout=3)
+                if not t.get("ok"): continue
+                tracks.append({"index": ti, "name": t["result"].get("name", "?")})
+            batch_mode = False
+
         tagged = untagged = 0
         print(f"{'Idx':4s} {'Track Name':30s} {'Role':10s} {'Category':12s}")
         print("-" * 60)
-        for ti in range(tc):
-            t = lp_call("get_track_info", {"track_index": ti}, timeout=3)
-            if not t.get("ok"): continue
-            name = t["result"].get("name", "?")
+        for track in tracks:
+            ti = track["index"]
+            name = track["name"]
             role = parse_track_role(name)
             cat = get_track_category(name) or "-"
             if role: tagged += 1
@@ -553,6 +565,8 @@ def main():
             print(f"  [{ti:2d}] {name:30s} {role or '-':10s} {cat:12s}")
         print("-" * 60)
         print(f"  {tagged} tagged, {untagged} untagged")
+        if batch_mode:
+            print(f"  (used get_all_track_names — fast path)")
 
     elif cmd == "scan":
         session = scan_session(fast=True)
