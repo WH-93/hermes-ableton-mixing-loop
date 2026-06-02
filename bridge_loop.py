@@ -30,6 +30,7 @@ import time
 PYTHON = "/Users/warrenhayes/mlx-env/bin/python"
 ANALYZER = os.path.expanduser("~/.hermes/scripts/audio_analyzer.py")
 PROFILE = os.path.expanduser("~/.hermes/data/deepspace_reference_profile.json")
+REF_DIR = os.path.expanduser("~/Desktop/Deepspace reference tracks")
 MIXING = os.path.expanduser("~/.hermes/scripts")
 sys.path.insert(0, MIXING)
 
@@ -44,6 +45,141 @@ BRIDGE_TX = 9881
 VALIDATION_INTERVAL = 10  # BlackHole ground truth every N iterations
 BANDS = ['sub', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'air']
 BAND_INDEX_MAP = {'sub': 0, 'bass': 1, 'low_mid': 2, 'mid': 3, 'high_mid': 4, 'presence': 5, 'air': 6}
+
+
+# ═══════════════════════════════════════════
+# REFERENCE TRACK SELECTION
+# ═══════════════════════════════════════════
+
+def list_reference_tracks():
+    """Return list of (index, filename) for all reference tracks."""
+    if not os.path.isdir(REF_DIR):
+        return []
+    tracks = []
+    for f in sorted(os.listdir(REF_DIR)):
+        if f.startswith("."):
+            continue
+        fp = os.path.join(REF_DIR, f)
+        if os.path.isdir(fp):
+            continue
+        ext = f.lower().rsplit(".", 1)[-1] if "." in f else ""
+        if ext in ("wav", "mp3", "flac", "aiff", "aif"):
+            tracks.append(fp)
+    return tracks
+
+
+def print_reference_tracks(tracks):
+    """Print numbered list of reference tracks."""
+    print(f"\n  {len(tracks)} reference tracks in {REF_DIR}:")
+    for i, fp in enumerate(tracks):
+        name = os.path.basename(fp)
+        print(f"  [{i+1:2d}] {name}")
+
+
+def build_profile_from_indices(track_paths, indices):
+    """Build aggregate profile from selected track paths by index (1-based).
+    Uses per-track cache (~/.hermes/data/deepspace_per_track/) for instant load.
+    Returns path to profile JSON, or None on failure."""
+    cache_dir = os.path.expanduser("~/.hermes/data/deepspace_per_track")
+
+    selected = []
+    for idx in sorted(set(indices)):
+        if 1 <= idx <= len(track_paths):
+            selected.append(track_paths[idx - 1])
+
+    if not selected:
+        return None
+
+    print(f"\n  Building profile from {len(selected)} track(s):")
+    analyses = []
+
+    for fp in selected:
+        name = os.path.basename(fp)
+        cache_path = os.path.join(cache_dir, name + '.json')
+        print(f"    - {name}", end='')
+
+        # Try cache first (instant)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as f:
+                    analyses.append(json.load(f))
+                print("  [cached]")
+                continue
+            except Exception:
+                pass
+
+        # Fallback: live analysis (~7s per track)
+        print("  [analyzing...]", end='', flush=True)
+        try:
+            r = subprocess.run(
+                [PYTHON, ANALYZER, "analyze", fp],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode == 0:
+                analyses.append(json.loads(r.stdout))
+                # Save to cache for next time
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, 'w') as f:
+                    f.write(r.stdout)
+                print(" ✓")
+            else:
+                print(f" ✗ failed")
+        except Exception as e:
+            print(f" ✗ {e}")
+
+    if not analyses:
+        return None
+
+    # Aggregate (same logic as build_profile in audio_analyzer.py)
+    import numpy as np
+    numeric_keys = [
+        "lufs_integrated", "peak_db", "rms_db", "crest_factor_db",
+        "spectral_centroid_mean", "spectral_rolloff_mean", "spectral_bandwidth_mean",
+        "rms_min_db", "rms_max_db", "rms_range_db",
+        "stereo_width", "stereo_correlation", "sub_ratio",
+    ]
+
+    profile = {"num_tracks": len(analyses), "files": [os.path.basename(fp) for fp in selected]}
+
+    for key in numeric_keys:
+        vals = [a[key] for a in analyses if a.get(key) is not None]
+        if vals:
+            profile[key] = {
+                "median": round(float(np.median(vals)), 2),
+                "mean": round(float(np.mean(vals)), 2),
+                "std": round(float(np.std(vals)), 2),
+                "min": round(float(min(vals)), 2),
+                "max": round(float(max(vals)), 2),
+            }
+
+    for band_type in ["band_levels", "octave_levels", "band_stereo_width"]:
+        agg = {}
+        for a in analyses:
+            if band_type not in a:
+                continue
+            for band_name, val in a[band_type].items():
+                if band_name not in agg:
+                    agg[band_name] = []
+                agg[band_name].append(val)
+        band_agg = {}
+        for band_name, vals in agg.items():
+            band_agg[band_name] = {
+                "median": round(float(np.median(vals)), 2),
+                "mean": round(float(np.mean(vals)), 2),
+                "std": round(float(np.std(vals)), 2),
+                "min": round(float(min(vals)), 2),
+                "max": round(float(max(vals)), 2),
+            }
+        profile[band_type] = band_agg
+
+    # Save to temp profile
+    fd, profile_path = tempfile.mkstemp(suffix='.json', prefix='ref_profile_')
+    os.close(fd)
+    with open(profile_path, 'w') as f:
+        json.dump(profile, f, indent=2)
+
+    print(f"    ✓ Profile saved: {profile_path}")
+    return profile_path
 
 
 # ═══════════════════════════════════════════
@@ -155,9 +291,10 @@ class BridgeSender:
 class AsyncValidation:
     """Spawn ffmpeg capture + analysis in background. Main loop polls for result."""
 
-    def __init__(self):
+    def __init__(self, profile_path=None):
         self._process = None
         self._wav_path = None
+        self._profile_path = profile_path or PROFILE
 
     def start(self):
         """Launch ffmpeg capture → analysis in background."""
@@ -190,7 +327,7 @@ class AsyncValidation:
 
         try:
             r = subprocess.run(
-                [PYTHON, ANALYZER, 'compare', self._wav_path, PROFILE],
+                [PYTHON, ANALYZER, 'compare', self._wav_path, self._profile_path],
                 capture_output=True, text=True, timeout=60,
             )
             self._cleanup()
@@ -340,8 +477,9 @@ def checkpoint_spectral(spectral):
 # MAIN ASYNC LOOP
 # ═══════════════════════════════════════════
 
-def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL):
+def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
     global _last_validation_deviation, _last_validation_spectral
+    profile_path = profile_path or PROFILE
 
     print("═" * 60)
     print("Bridge Async Mixing Loop")
@@ -422,7 +560,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL):
                 print(f"[{i+1:3d}] ⏳ waiting for first validation  ({time.time()-t0:.3f}s)")
                 # Spawn first validation if not already running
                 if validation is None:
-                    validation = AsyncValidation()
+                    validation = AsyncValidation(profile_path)
                     validation.start()
                     print(f"  ⏳ BlackHole validation started...")
                 time.sleep(0.5)
@@ -494,7 +632,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL):
 
         # ── Spawn validation if due ──
         if (i + 1) % validate_every == 0 and validation is None:
-            validation = AsyncValidation()
+            validation = AsyncValidation(profile_path)
             validation.start()
             print(f"  ⏳ BlackHole validation started (will resolve in ~5s)...")
             applied_fix = False  # reset — ground truth about to refresh
@@ -522,5 +660,35 @@ if __name__ == '__main__':
                         help='Max iterations (default: 50)')
     parser.add_argument('-v', '--validate-every', type=int, default=VALIDATION_INTERVAL,
                         help=f'Validation interval (default: {VALIDATION_INTERVAL})')
+    parser.add_argument('--refs', type=str, default=None,
+                        help='Comma-separated reference track indices (e.g. "3,5,12")')
+    parser.add_argument('--list-refs', action='store_true',
+                        help='List available reference tracks and exit')
     args = parser.parse_args()
-    run_async_loop(iterations=args.iterations, validate_every=args.validate_every)
+
+    # --list-refs: print and exit
+    if args.list_refs:
+        tracks = list_reference_tracks()
+        print_reference_tracks(tracks)
+        sys.exit(0)
+
+    # --refs: build targeted profile
+    profile_path = PROFILE
+    if args.refs:
+        tracks = list_reference_tracks()
+        if not tracks:
+            print("ERROR: No reference tracks found in", REF_DIR)
+            sys.exit(1)
+        try:
+            indices = [int(x.strip()) for x in args.refs.split(',')]
+        except ValueError:
+            print("ERROR: --refs must be comma-separated numbers, e.g. '3,5,12'")
+            sys.exit(1)
+
+        profile_path = build_profile_from_indices(tracks, indices)
+        if not profile_path:
+            print("ERROR: Failed to build profile from indices", args.refs)
+            sys.exit(1)
+
+    run_async_loop(iterations=args.iterations, validate_every=args.validate_every,
+                   profile_path=profile_path)
