@@ -59,6 +59,22 @@ BAND_TO_EQ_FILTER = {
 }
 
 
+def sigmas_to_q(sigmas):
+    """Map spectral deviation magnitude to EQ Q (resonance).
+    Big gap → wide Q (low resonance) to cover more frequencies.
+    Small gap → narrow Q (high resonance) for surgical fix.
+    Returns resonance value 0.0-1.0 (EQ Eight: 0=wide, 1=narrow)."""
+    if sigmas > 8:
+        return 0.15   # very wide — whole region needs fixing
+    elif sigmas > 4:
+        return 0.30   # wide
+    elif sigmas > 2:
+        return 0.50   # medium
+    elif sigmas > 1:
+        return 0.70   # narrow — surgical
+    return None        # within deadband
+
+
 # ═══════════════════════════════════════════
 # REFERENCE TRACK SELECTION
 # ═══════════════════════════════════════════
@@ -420,7 +436,8 @@ def get_device_params(ti, di):
 
 def get_cached_param_index(ti, di, param_hints, band_name=None):
     """Find param index matching hints. For EQ Eight, uses band_name
-    to target the correct filter (e.g. 'bass' → filter 2 gain, not filter 1)."""
+    to target the correct filter (e.g. 'bass' → filter 2 gain, not filter 1).
+    Returns (index, param_name) or (None, None)."""
     key = (ti, di)
     if key not in _param_cache:
         _param_cache[key] = get_device_params(ti, di)
@@ -435,22 +452,43 @@ def get_cached_param_index(ti, di, param_hints, band_name=None):
             filter_prefix = f"{filter_num} {hint_lower}"
             for pname, pinfo in params.items():
                 if filter_prefix in pname:
-                    return pinfo['index']
-            # Fallback: "2 gain" not found, try "1 gain" (adjacent band)
+                    return pinfo['index'], pname
+            # Fallback: adjacent band
             for offset in [1, -1, 2, -2]:
                 alt = filter_num + offset
                 if 1 <= alt <= 8:
                     alt_prefix = f"{alt} {hint_lower}"
                     for pname, pinfo in params.items():
                         if alt_prefix in pname:
-                            return pinfo['index']
+                            return pinfo['index'], pname
 
-    # Generic fallback: substring match (original behavior)
+    # Generic fallback: substring match
     for hint in param_hints:
         hint_lower = hint.lower()
         for pname, pinfo in params.items():
             if hint_lower in pname:
-                return pinfo['index']
+                return pinfo['index'], pname
+    return None, None
+
+
+def get_resonance_index(ti, di, gain_param_name):
+    """Given a gain param like '2 gain a', find the matching resonance param
+    ('2 resonance a') and return its index, or None."""
+    key = (ti, di)
+    if key not in _param_cache:
+        _param_cache[key] = get_device_params(ti, di)
+    params = _param_cache[key]
+
+    # Replace 'gain' with 'resonance' in the param name
+    res_name = gain_param_name.replace('gain', 'resonance')
+    if res_name in params:
+        return params[res_name]['index']
+    # Also try without 'a'/'b' suffix
+    base = gain_param_name.rsplit(' ', 1)[0]  # "2 gain"
+    for suffix in ['a', 'b']:
+        candidate = f"{base.replace('gain', 'resonance')} {suffix}"
+        if candidate in params:
+            return params[candidate]['index']
     return None
 
 
@@ -636,20 +674,32 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
 
                 if match:
                     ti, di, dname, tname = match
-                    pidx = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
+                    pidx, pname = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
                     if pidx is not None:
                         # Get current value for relative adjustment
                         key = (ti, di)
                         current_val = 0.5  # default midpoint
                         if key in _param_cache:
-                            for pname, pinfo in _param_cache[key].items():
+                            for _pn, pinfo in _param_cache[key].items():
                                 if pinfo['index'] == pidx:
                                     current_val = pinfo['value']
                                     break
                         delta = fix['delta_base'] * PROPORTIONAL_GAIN
                         new_val = max(0.0, min(1.0, current_val + delta))
                         bridge.set_param(ti, di, pidx, new_val)
-                        print(f"     ✏️  {dname}({tname}) Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
+
+                        # ── Q adjustment: wider gap → wider Q (lower resonance) ──
+                        q_val = sigmas_to_q(target_sigmas)
+                        if q_val is not None:
+                            ridx = get_resonance_index(ti, di, pname)
+                            if ridx is not None:
+                                bridge.set_param(ti, di, ridx, q_val)
+                                print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val:.2f}")
+                            else:
+                                print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
+                        else:
+                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
+
                         last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
                         checkpoint_spectral(spectral)  # baseline BEFORE fix
                         applied_fix = True
