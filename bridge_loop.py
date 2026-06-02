@@ -41,7 +41,7 @@ from mixing import (
 )
 
 BRIDGE_RX = 9880
-BRIDGE_TX = 9881
+BRIDGE_TX = 9882  # set_param commands (separate from spectral stream's udpsend 9880)
 VALIDATION_INTERVAL = 10  # BlackHole ground truth every N iterations
 BANDS = ['sub', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'air']
 BAND_INDEX_MAP = {'sub': 0, 'bass': 1, 'low_mid': 2, 'mid': 3, 'high_mid': 4, 'presence': 5, 'air': 6}
@@ -291,34 +291,24 @@ class SpectralReceiver(threading.Thread):
 # ═══════════════════════════════════════════
 
 class BridgeSender:
-    """Parameter writer. Uses TCP (LivePilot) since bridge set_param
-    is unreliable — bridge is only used for spectral streaming."""
+    """Parameter writer via M4L bridge UDP. Fire-and-forget — writes
+    are confirmed via BlackHole validation, not per-write responses."""
 
     def __init__(self):
-        pass
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def set_param(self, track_idx, device_idx, param_idx, value):
-        """Set parameter via LivePilot TCP."""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect(('127.0.0.1', 9878))
-            s.sendall(json.dumps({'id':'bp','type':'set_device_parameter',
-                'params':{'track_index':track_idx,'device_index':device_idx,
-                          'parameter_index':param_idx,'value':value}}).encode()+b'\n')
-            r = b''
-            while True:
-                try:
-                    c = s.recv(65536)
-                    if not c: break
-                    r += c
-                except: break
-            s.close()
-        except Exception:
-            pass
+        """Send /set_param OSC command to bridge port 9882."""
+        addr = b'/set_param\x00\x00'
+        types = b',iiif\x00'
+        args = struct.pack('>iiif', track_idx, device_idx, param_idx, float(value))
+        self._sock.sendto(addr + types + args, ('127.0.0.1', 9882))
 
     def close(self):
-        pass
+        try:
+            self._sock.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════
