@@ -46,6 +46,18 @@ VALIDATION_INTERVAL = 10  # BlackHole ground truth every N iterations
 BANDS = ['sub', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'air']
 BAND_INDEX_MAP = {'sub': 0, 'bass': 1, 'low_mid': 2, 'mid': 3, 'high_mid': 4, 'presence': 5, 'air': 6}
 
+# EQ Eight has 8 filters. Map each spectral band to the closest filter number.
+# Filter 1 = lowest freq (sub), Filter 8 = highest (air).
+BAND_TO_EQ_FILTER = {
+    'sub': 1,        # 20-60Hz
+    'bass': 2,       # 60-120Hz
+    'low_mid': 3,    # 120-250Hz
+    'mid': 5,        # 250-2000Hz
+    'high_mid': 6,   # 2000-6000Hz
+    'presence': 7,   # 6000-12000Hz
+    'air': 8,        # 12000Hz+
+}
+
 
 # ═══════════════════════════════════════════
 # REFERENCE TRACK SELECTION
@@ -406,14 +418,37 @@ def get_device_params(ti, di):
     return {p['name'].lower(): {'index': p['index'], 'value': p['value']}
             for p in r['result'].get('parameters', [])}
 
-def get_cached_param_index(ti, di, param_hints):
+def get_cached_param_index(ti, di, param_hints, band_name=None):
+    """Find param index matching hints. For EQ Eight, uses band_name
+    to target the correct filter (e.g. 'bass' → filter 2 gain, not filter 1)."""
     key = (ti, di)
     if key not in _param_cache:
         _param_cache[key] = get_device_params(ti, di)
-    # param_hints are substrings, not exact keys (e.g. "gain" matches "1 Gain A")
+    params = _param_cache[key]
+
+    # If band specified and device looks like EQ, prefer band-specific filter
+    if band_name and band_name in BAND_TO_EQ_FILTER:
+        filter_num = BAND_TO_EQ_FILTER[band_name]
+        for hint in param_hints:
+            hint_lower = hint.lower()
+            # Try band-specific first: "2 gain a" for bass
+            filter_prefix = f"{filter_num} {hint_lower}"
+            for pname, pinfo in params.items():
+                if filter_prefix in pname:
+                    return pinfo['index']
+            # Fallback: "2 gain" not found, try "1 gain" (adjacent band)
+            for offset in [1, -1, 2, -2]:
+                alt = filter_num + offset
+                if 1 <= alt <= 8:
+                    alt_prefix = f"{alt} {hint_lower}"
+                    for pname, pinfo in params.items():
+                        if alt_prefix in pname:
+                            return pinfo['index']
+
+    # Generic fallback: substring match (original behavior)
     for hint in param_hints:
         hint_lower = hint.lower()
-        for pname, pinfo in _param_cache[key].items():
+        for pname, pinfo in params.items():
             if hint_lower in pname:
                 return pinfo['index']
     return None
@@ -601,11 +636,20 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
 
                 if match:
                     ti, di, dname, tname = match
-                    pidx = get_cached_param_index(ti, di, fix['params'])
+                    pidx = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
                     if pidx is not None:
+                        # Get current value for relative adjustment
+                        key = (ti, di)
+                        current_val = 0.5  # default midpoint
+                        if key in _param_cache:
+                            for pname, pinfo in _param_cache[key].items():
+                                if pinfo['index'] == pidx:
+                                    current_val = pinfo['value']
+                                    break
                         delta = fix['delta_base'] * PROPORTIONAL_GAIN
-                        bridge.set_param(ti, di, pidx, 0.5 + delta)
-                        print(f"     ✏️  {dname}({tname}) Δ{delta:+.2f}")
+                        new_val = max(0.0, min(1.0, current_val + delta))
+                        bridge.set_param(ti, di, pidx, new_val)
+                        print(f"     ✏️  {dname}({tname}) Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
                         last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
                         checkpoint_spectral(spectral)  # baseline BEFORE fix
                         applied_fix = True
@@ -621,8 +665,17 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
             # Reverse last fix
             if last_fix_info:
                 ti, di, pidx, delta, _, _ = last_fix_info
-                bridge.set_param(ti, di, pidx, 0.5 - delta)
-                print(f"     ↩  reversed Δ{delta:+.2f}")
+                # Reverse: subtract delta from current value
+                key = (ti, di)
+                current_val = 0.5
+                if key in _param_cache:
+                    for pname, pinfo in _param_cache[key].items():
+                        if pinfo['index'] == pidx:
+                            current_val = pinfo['value']
+                            break
+                new_val = max(0.0, min(1.0, current_val - delta))
+                bridge.set_param(ti, di, pidx, new_val)
+                print(f"     ↩  reversed Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
                 applied_fix = False
         else:
             print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} monitoring  ({time.time()-t0:.3f}s)")
