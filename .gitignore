@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.wav
+/tmp/
+.DS_Store
+mix_loop_history.json
+mix_loop_scan_cache.json
