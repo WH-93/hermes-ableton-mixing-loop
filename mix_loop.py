@@ -207,16 +207,81 @@ def compare_file(filepath, profile_path=PROFILE):
 # e.g., "kick punchy 808" → role=kick, "bass FM dark" → role=bass
 
 ROLE_TO_CATEGORY = {
-    "kick": "low_end", "bass": "low_end", "sub": "low_end", "rumble": "low_end", "808": "low_end",
-    "hats": "hi_freq", "hat": "hi_freq", "ride": "hi_freq", "cymbal": "hi_freq", "hihat": "hi_freq",
-    "synth": "synth", "pad": "synth", "chord": "synth", "lead": "synth",
-    "hook": "synth", "melody": "synth", "arp": "synth",
-    "perc": "percussion", "toms": "percussion", "tom": "percussion",
-    "conga": "percussion", "clap": "percussion", "snare": "percussion", "shaker": "percussion",
-    "fx": "spatial", "reverb": "spatial", "delay": "spatial",
-    "echo": "spatial", "noise": "spatial", "riser": "spatial", "sweep": "spatial",
-    "group": "mix_bus", "bus": "mix_bus", "master": "mix_bus", "mix": "mix_bus",
-    "vox": "mid", "vocal": "mid", "voice": "mid", "sample": "mid",
+    # ─── LOW END — sub/bass adjustments ───
+    "kick": "low_end", "kicks": "low_end",
+    "bass": "low_end", "basses": "low_end", "bassline": "low_end",
+    "sub": "low_end", "subs": "low_end",
+    "rumble": "low_end", "rumbles": "low_end",
+    "808": "low_end", "909": "low_end",
+    "lowend": "low_end", "low": "low_end",
+    "thump": "low_end", "weight": "low_end", "body": "low_end",
+
+    # ─── HIGH FREQ — presence/air adjustments ───
+    "hats": "hi_freq", "hat": "hi_freq",
+    "ride": "hi_freq", "rides": "hi_freq",
+    "cymbal": "hi_freq", "cymbals": "hi_freq", "crash": "hi_freq",
+    "hihat": "hi_freq", "hihats": "hi_freq", "hh": "hi_freq",
+    "openhat": "hi_freq", "closedhat": "hi_freq",
+    "shimmer": "hi_freq", "sparkle": "hi_freq",
+    "top": "hi_freq", "tops": "hi_freq",
+
+    # ─── SYNTH — midrange/presence/width ───
+    "synth": "synth", "synths": "synth",
+    "pad": "synth", "pads": "synth",
+    "chord": "synth", "chords": "synth",
+    "lead": "synth", "leads": "synth",
+    "hook": "synth", "hooks": "synth",
+    "melody": "synth", "melodies": "synth",
+    "arp": "synth", "arps": "synth", "arpeggio": "synth",
+    "stab": "synth", "stabs": "synth",
+    "pluck": "synth", "plucks": "synth",
+    "drone": "synth", "drones": "synth",
+    "texture": "synth", "textures": "synth",
+    "keys": "synth", "key": "synth",
+    "organ": "synth", "piano": "synth",
+
+    # ─── PERCUSSION — presence adjustments ───
+    "perc": "percussion", "percs": "percussion", "percussion": "percussion",
+    "toms": "percussion", "tom": "percussion",
+    "conga": "percussion", "congas": "percussion",
+    "clap": "percussion", "claps": "percussion",
+    "snare": "percussion", "snares": "percussion",
+    "shaker": "percussion", "shakers": "percussion",
+    "rim": "percussion", "rims": "percussion", "rimshot": "percussion",
+    "cowbell": "percussion", "tambourine": "percussion",
+    "maraca": "percussion", "maracas": "percussion",
+    "triangle": "percussion",
+    "woodblock": "percussion", "block": "percussion",
+    "drum": "percussion", "drums": "percussion",
+    "click": "percussion", "clicks": "percussion",
+    "transient": "percussion",
+
+    # ─── SPATIAL — air/width ───
+    "fx": "spatial", "fxs": "spatial", "effect": "spatial", "effects": "spatial",
+    "reverb": "spatial", "reverbs": "spatial",
+    "delay": "spatial", "delays": "spatial",
+    "echo": "spatial", "echoes": "spatial",
+    "noise": "spatial", "noises": "spatial",
+    "riser": "spatial", "risers": "spatial",
+    "sweep": "spatial", "sweeps": "spatial",
+    "wash": "spatial", "washes": "spatial",
+    "atmosphere": "spatial", "ambience": "spatial", "ambient": "spatial",
+    "space": "spatial",
+
+    # ─── MIX BUS — master level/compression/dynamics ───
+    "group": "mix_bus", "groups": "mix_bus",
+    "bus": "mix_bus", "busses": "mix_bus", "buses": "mix_bus",
+    "master": "mix_bus", "masters": "mix_bus",
+    "mix": "mix_bus",
+    "main": "mix_bus",
+    "sum": "mix_bus",
+
+    # ─── MID — low-mids/presence ───
+    "vox": "mid", "vocal": "mid", "vocals": "mid",
+    "voice": "mid", "voices": "mid",
+    "sample": "mid", "samples": "mid",
+    "chop": "mid", "chops": "mid",
+    "phrase": "mid", "phrases": "mid",
 }
 
 CATEGORY_TARGETS = {
