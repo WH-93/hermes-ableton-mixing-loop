@@ -89,11 +89,14 @@ def get_all_device_parameters(song, params):
         interesting = frozenset(filter_types)
     
     # Only return parameters we actually use (massive speedup)
+    # Pass parameter_filter: null or [] to get ALL params (slow but complete)
     param_filter = params.get("parameter_filter")
-    if param_filter:
+    if param_filter is not None and len(param_filter) == 0:
+        param_filter = None  # empty list = no filter
+    elif param_filter:
         param_filter = frozenset(p.lower() for p in param_filter)
     else:
-        # Default: only mixing-relevant params
+        # Default: only mixing-relevant params (~200 vs 3500)
         param_filter = frozenset([
             "device on", "gain", "output gain", "drive", "threshold",
             "ratio", "attack", "release", "boom", "frequency",

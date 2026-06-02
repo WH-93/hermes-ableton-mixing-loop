@@ -156,13 +156,12 @@ def scan_session(fast=True, force=False):
                     "track_name": track_name, "track_muted": track_muted,
                     "device_name": dev["name"],
                 }
-                if not fast:
-                    # Params already included in batch response
-                    params = {}
-                    for p in dev.get("parameters", []):
-                        pname = p.get("name", "").lower()
-                        params[pname] = {"index": p["index"], "value": p["value"]}
-                    entry["params"] = params
+                # Always include params from batch — they're free (already read by LOM)
+                params = {}
+                for p in dev.get("parameters", []):
+                    pname = p.get("name", "").lower()
+                    params[pname] = {"index": p["index"], "value": p["value"]}
+                entry["params"] = params
                 devices.append(entry)
     else:
         # Fallback: per-track calls (slow)
@@ -224,7 +223,10 @@ def apply_greedy_tcp(session_devices, band_issues, iteration=0, peak_db=None):
         return [f"Iter[{iteration}]: No device found for '{rec_text}'"]
 
     ti, di, dname, tname = match
-    params = fetch_device_params(ti, di)
+    # Use cached params from scan if available, otherwise fetch
+    cached_device = next((d for d in session_devices 
+                          if d["track_idx"] == ti and d["device_idx"] == di), None)
+    params = cached_device.get("params") if cached_device and cached_device.get("params") else fetch_device_params(ti, di)
     p_match = find_param_in_device(params, fix["params"])
     if not p_match:
         return [f"Iter[{iteration}]: No matching param on {dname}({tname})"]
