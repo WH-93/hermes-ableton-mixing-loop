@@ -249,11 +249,11 @@ def apply_greedy_tcp(session_devices, band_issues, iteration=0, peak_db=None):
     status = "OK" if r.get("ok") else "FAIL"
 
     if status == "OK":
-        verify = fetch_device_params(ti, di)
-        v = find_param_in_device(verify, [pname])
-        if v and abs(v[2] - new_val) > 0.01:
+        # set_device_parameter returns the actual value — no separate read needed
+        actual = r.get("result", {}).get("value")
+        if actual is not None and abs(actual - new_val) > 0.01:
             status = "REJECTED"
-            new_val = v[2]
+            new_val = actual
 
     ratio_info = f" [{band} {direction}]" if "/" in band else ""
     return [f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → {dname}({tname}) {pname}: {current:.3f}→{new_val:.3f} (Δ{delta:+.3f}){ratio_info} [{status}]"]
