@@ -222,7 +222,8 @@ def get_track_names():
 
 
 # ─── Device cache (avoids redundant get_track_info calls) ───
-_track_cache = {}  # track_idx -> {"name": str, "devices": [{"index": int, "name": str}]}
+_track_cache = {}  # track_idx → {"name": str, "devices": [{"index": int, "name": str}]}
+_param_index_cache = {}  # (track_idx, device_idx) → {param_name: param_index}
 
 
 def _get_track_devices(ti):
@@ -280,37 +281,58 @@ def resolve_and_apply(band_issues, track_names, iteration=0, peak_db=None):
 
     ti, di, dname, tname = match
 
-    # 3. Read current param value (ONE targeted call)
+    # 3. Compute delta (analysis-driven, level-independent)
+    delta = fix["delta_base"] * prop_factor * min(1.0, sigmas / 3.0)
+
+    if delta > 0 and redline_active:
+        return [f"Iter[{iteration}]: BLOCKED — redline ({peak_db:.1f} dBFS)"]
+    if abs(delta) < 0.005:
+        return [f"Iter[{iteration}]: Deadband — delta too small"]
+
+    # 4. Get param index (cached after first read per device)
+    cache_key = (ti, di)
+    if cache_key in _param_index_cache:
+        # Cached: write directly, no read needed
+        for cand_name in fix["params"]:
+            if cand_name in _param_index_cache[cache_key]:
+                pidx = _param_index_cache[cache_key][cand_name]
+                # Approximate new_val from midpoint
+                new_val = max(0.0, min(1.0, 0.3 + delta))
+                r = lp_call("set_device_parameter", {"track_index": ti, "device_index": di, "parameter_index": pidx, "value": new_val})
+                status = "OK" if r.get("ok") else "FAIL"
+                actual = r.get("result", {}).get("value")
+                if actual is not None and abs(actual - new_val) > 0.01:
+                    status = "REJECTED"
+                    new_val = actual
+                ratio_info = f" [{band} {direction}]" if "/" in band else ""
+                return [f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → {dname}({tname}): Δ{delta:+.3f}→{new_val:.3f} [{status}] (cached)"]
+        # Param hint not found in cache — fall through to full read
+
+    # First call or cache miss: read params to build index map
     params = fetch_device_params(ti, di)
+    # Build cache
+    idx_map = {}
+    for pn, pi in params.items():
+        idx_map[pn] = pi["index"]
+    _param_index_cache[cache_key] = idx_map
+
     p_match = find_param_in_device(params, fix["params"])
     if not p_match:
         return [f"Iter[{iteration}]: No matching param on {dname}({tname})"]
 
     pname, pidx, current = p_match
-    delta = fix["delta_base"] * prop_factor * min(1.0, sigmas / 3.0)
-
-    if delta > 0 and redline_active:
-        return [f"Iter[{iteration}]: BLOCKED — redline ({peak_db:.1f} dBFS)"]
-
     new_val = current + delta
     ck = fix.get("ceiling")
     if ck and delta > 0 and current >= GAIN_CEILINGS.get(ck, 1.0):
         return [f"Iter[{iteration}]: AT-CEIL[{ti}] {dname}({tname}) {pname}: {current:.3f}"]
     if ck and delta < 0:
         new_val = max(new_val, GAIN_FLOORS.get(ck, 0.0))
-    if abs(delta) < 0.005:
-        return [f"Iter[{iteration}]: Deadband — delta too small"]
-
     new_val = max(0.0, min(1.0, new_val))
-
-    # 4. Skip write if value unchanged (floor/ceiling hit)
     if abs(new_val - current) < 0.001:
         return [f"Iter[{iteration}]: SKIP {dname}({tname}) {pname}: already at {current:.3f}"]
 
-    # 5. Apply (ONE write)
     r = lp_call("set_device_parameter", {"track_index": ti, "device_index": di, "parameter_index": pidx, "value": new_val})
     status = "OK" if r.get("ok") else "FAIL"
-
     if status == "OK":
         actual = r.get("result", {}).get("value")
         if actual is not None and abs(actual - new_val) > 0.01:
