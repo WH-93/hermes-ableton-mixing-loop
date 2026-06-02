@@ -87,6 +87,20 @@ def get_all_device_parameters(song, params):
     filter_types = params.get("device_types")
     if filter_types:
         interesting = frozenset(filter_types)
+    
+    # Only return parameters we actually use (massive speedup)
+    param_filter = params.get("parameter_filter")
+    if param_filter:
+        param_filter = frozenset(p.lower() for p in param_filter)
+    else:
+        # Default: only mixing-relevant params
+        param_filter = frozenset([
+            "device on", "gain", "output gain", "drive", "threshold",
+            "ratio", "attack", "release", "boom", "frequency",
+            "dry/wet", "wet dry", "mix", "decay", "decay time",
+            "width", "stereo width", "level", "volume",
+            "filter freq", "filter frequency",
+        ])
 
     result = []
     for ti, track in enumerate(song.tracks):
@@ -96,6 +110,8 @@ def get_all_device_parameters(song, params):
                 continue
             parameters = []
             for pi, param in enumerate(device.parameters):
+                if param_filter and param.name.lower() not in param_filter:
+                    continue
                 try:
                     value_string = param.str_for_value(param.value)
                 except Exception:
