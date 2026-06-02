@@ -1,57 +1,88 @@
 # Hermes ↔ Ableton Closed-Loop Mixing
 
-AI-assisted mixing loop: capture Ableton output via BlackHole → ratio-based spectral analysis → greedy single-shot optimization → LivePilot parameter control.
+AI-assisted mixing loop: capture Ableton output → spectral analysis → category routing → EQ adjustment with Q mapping.
 
 ## Architecture
 
 ```
 audio_analyzer.py    520 lines   Pure analysis (librosa STFT, LUFS, ratio comparison)
-mixing.py            350 lines   Shared logic (120+ role tags, presets, greedy, safety)
-mix_loop.py          380 lines   Raw TCP transport + standalone CLI (14 commands)
+mixing.py            450 lines   Shared logic (120+ role tags, presets, greedy, safety)
+bridge_loop.py       850 lines   Async UDP receiver thread + TCP fallback (high-speed)
+mix_loop.py          380 lines   Raw TCP transport + standalone CLI (14 commands, legacy)
 orchestrator.py      310 lines   Hermes MCP transport (imports mixing, no transport calls)
-tests/               4 files     63 unit tests
+tests/               4 files    63 unit tests
 
 LivePilot patches (applied to Remote Script):
   devices.py   → get_all_device_parameters (150s scan → 3s)
   tracks.py    → get_all_track_names (90s roles → 1s)
   server.py    → FAST_WRITE_COMMANDS (skip 100ms settle delay)
+
+M4L bridge:
+  LivePilot_Analyzer.amxd on master track → UDP 9880/9881
+  continuous 7-band spectral stream at ~50Hz
+  set_param via UDP OSC (2ms vs 3s TCP)
 ```
 
-## Quick Start
+## Two Loop Drivers
+
+### bridge_loop.py — high-speed async (recommended)
+
+```
+M4L bridge (UDP spectral stream) → Receiver thread (non-blocking)
+    → Main loop: analyze → map fix → UDP set_param (2ms)
+    → BlackHole validation (async subprocess, every N iterations)
+```
+
+Per-iteration: ~5ms. Supports reference track selection, band-to-EQ filter mapping, Q/resonance mapping.
 
 ```bash
-# 1. Check your track roles (fast — uses get_all_track_names)
-python3 mix_loop.py roles
+# List all 31 reference tracks
+python bridge_loop.py --list-refs
 
-# 2. Analyze without changing anything
-python3 mix_loop.py capture 4
+# Run against specific tracks (cached, instant profile build)
+python bridge_loop.py --refs 12,19,24 -n 30
 
-# 3. Run one fix cycle (analyze + apply)
-python3 mix_loop.py fix 4
-
-# 4. Run 3 iterations with convergence tracking
-python3 mix_loop.py loop 3 4
-
-# 5. Apply a preset to a specific track
-python3 mix_loop.py target "kick" aggressive
+# Run against all tracks (default)
+python bridge_loop.py -n 50 -v 10
 ```
 
-## Commands
+### mix_loop.py — synchronous TCP (legacy)
 
-| Command | Description |
-|---------|-------------|
-| `capture [s]` | Analyze only, print JSON (band_issues, recommendations). Default 4s. |
-| `fix [s]` | One capture→analyze→apply cycle. Auto-snapshots. |
-| `loop [n] [s]` | n iterations with convergence tracking, time budgets, frozen scan. |
-| `target <id> <preset>` | Apply preset to track by index, name, or role tag. |
-| `presets` | List all 10 available presets. |
-| `roles` | Show all tracks with role classification. |
-| `scan` | Show all devices with role tags. |
-| `snapshot` | Save all device params for rollback. |
-| `rollback` | Restore all params from last snapshot. |
-| `analyze <file>` | Compare WAV/MP3/FLAC against reference profile. |
-| `history` | Show iteration history. |
-| `clear-history` | Reset iteration history. |
+```bash
+python mix_loop.py roles        # Check track roles
+python mix_loop.py capture 4    # Analyze without changing
+python mix_loop.py fix 4        # One capture→analyze→apply
+python mix_loop.py loop 3 4     # 3 iterations
+python mix_loop.py target "kick" aggressive  # Apply preset
+```
+
+## Category Routing
+
+Spectral bands route fixes to the right track by role tag:
+
+| Spectral band | Category | Example tracks |
+|---|---|---|
+| sub, bass | low_end | KICK, BASS, SUB, RUMBLE |
+| presence, air | hi_freq | HATS, RIDE, CYMBAL, SHIMMER |
+| low_mid, mid | synth, mid | PAD, LEAD, CHORD, VOX |
+| — | spatial | FX, REVERB, DELAY |
+
+If no categorized track found, falls back to all unmuted tracks.
+
+## Band-to-EQ-Filter & Q Mapping
+
+| Spectral band | EQ filter | Q (>8σ) | Q (4-8σ) | Q (2-4σ) | Q (1-2σ) |
+|---|---|---|---|---|---|
+| sub | 1 | 0.15 | 0.30 | 0.50 | 0.70 |
+| bass | 2 | 0.15 | 0.30 | 0.50 | 0.70 |
+| low_mid | 3 | 0.15 | 0.30 | 0.50 | 0.70 |
+| mid | 5 | 0.15 | 0.30 | 0.50 | 0.70 |
+| high_mid | 6 | 0.15 | 0.30 | 0.50 | 0.70 |
+| presence | 7 | 0.15 | 0.30 | 0.50 | 0.70 |
+| air | 8 | 0.15 | 0.30 | 0.50 | 0.70 |
+
+Wider spectral gap → wider Q (lower resonance) to cover more frequencies.
+Narrow gap → surgical Q.
 
 ## Track Role Tagging
 
@@ -59,21 +90,19 @@ python3 mix_loop.py target "kick" aggressive
 
 120+ tags across 7 categories. Examples: `kick punchy 808`, `hats 909 minimal`, `bass FM dark`, `pad warm chords`, `group drums`.
 
-Full tag list in `mixing.py` → `ROLE_TO_CATEGORY`. Run `roles` command to audit.
+Full tag list in `mixing.py` → `ROLE_TO_CATEGORY`.
 
 ## Safety Features
 
-- **Role-based targeting**: Hits the right track by role tag
-- **Ratio-based comparison**: Level-independent — compares band relationships, not absolute levels
-- **Greedy single-shot**: One fix per iteration — no conflicting changes
-- **Gain ceiling**: Parameters have hard maximums
-- **Deadband**: No adjustment within 0.8 sigma of reference
+- **Category routing**: Air fixes go to hats, bass fixes go to KICK
+- **Band-to-filter mapping**: Correct EQ band for each spectral region
+- **Q/resonance mapping**: Wider gaps get wider Q
+- **EQ8 bipolar clamp**: Gain values clamped [-1, +1] (EQ Eight is bipolar, not unipolar)
+- **Relative adjustment**: Current value + delta, not absolute 0.5 + delta
+- **Param cache**: Updated after every write for consistent reads
+- **ensure_device**: Adds EQ Eight/Utility via LivePilot if track doesn't have one
+- **Deadband**: No adjustment within 0.8 sigma
 - **Proportional control**: Deltas shrink each iteration
-- **Red-line protection**: Blocks gain increases if peak > -0.5 dBFS
-- **Parameter verification**: Reads actual value from set_device_parameter response (no extra call)
-- **Time budgets**: 120s loop total, 20s per iteration (NASA Rule 2)
-- **Frozen scan**: One scan at loop start, reused across all iterations
-- **Snapshot/rollback**: Auto-snapshot before fix/loop, rollback anytime
 
 ## LivePilot Patches
 
@@ -84,13 +113,13 @@ Applied to `~/Music/Ableton/User Library/Remote Scripts/LivePilot/`. Requires Ab
 | `devices.py` | `get_all_device_parameters` | 150s scan → 3s |
 | `tracks.py` | `get_all_track_names` | 90s roles → 1s |
 | `server.py` | FAST_WRITE_COMMANDS | 100ms settle → 0ms |
-| `mix_loop.py` | response value check | 3s verify → 0ms |
 
 All scripts auto-detect if patches are loaded and fall back gracefully.
 
 ## Known Limitations
 
-- LivePilot LOM calls take ~3s each — not fixable in Remote Script (Ableton API limitation)
-- Reference profile is 31 mastered deep techno tracks at -7.5 LUFS
-- Ratio-based comparison helps but mastered vs unmastered is never exact
-- Track role tagging requires manually renaming tracks in Ableton
+- Bridge spectral at 50Hz is too noisy for <0.05 gain changes — causes oscillation
+- Small deltas (0.02) barely register on 7-band master spectrum
+- No subjective override channel yet ("hats too dull")
+- Reference profile is static — no live reference capture
+- LivePilot TCP calls take ~3s (initial device discovery slow)

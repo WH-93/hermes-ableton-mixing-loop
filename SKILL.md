@@ -1,153 +1,139 @@
 ---
 name: hermes-ableton-mixing-loop
 description: "Closed-loop mixing: BlackHole capture, spectral analysis, reference comparison, LivePilot parameter adjustment. Also direct track targeting with presets."
-version: 2.0.0
+version: 3.0.0
 ---
 
 # Hermes ↔ Ableton Closed-Loop Mixing
 
 Trigger: user wants to mix a track in Ableton with objective audio analysis feedback, or apply presets to specific tracks.
 
-## Pipeline Overview
+## Two Loop Drivers
 
+### bridge_loop.py — async high-speed (UDP + TCP)
+Location: `~/.hermes/scripts/bridge_loop.py`
+
+Architecture:
 ```
-Ableton → BlackHole 2ch → ffmpeg capture → audio_analyzer.py
-    → ratio-based comparison vs reference profile → greedy single-shot fix
-    → LivePilot TCP → set_device_parameter → repeat
+M4L bridge (UDP 9880 spectral stream) → Receiver thread (non-blocking buffer)
+    → Main loop: analyze → map fix → UDP set_param (2ms)
+    → BlackHole validation (async subprocess, every N iterations)
+    → Bridge spectral tracks direction between validations
 ```
+
+Per-iteration latency: ~5ms (vs 15-30s for mix_loop.py TCP).
+
+Key features:
+- `--list-refs` — numbered list of 31 reference tracks
+- `--refs 3,5,12` — targeted profile from specific tracks (cached, instant)
+- Category-based track routing (air→hats, bass→KICK, etc.)
+- Band-to-EQ-filter mapping (bass→filter 2, air→filter 8)
+- Q/resonance mapped to spectral gap width (sigmas→Q)
+- ensure_device() adds EQ Eight via LivePilot if missing
+- Per-track analysis cache at `~/.hermes/data/deepspace_per_track/`
+
+### mix_loop.py — synchronous TCP (legacy)
+Location: repo root
+
+14 CLI commands: capture, fix, loop, target, presets, roles, scan, snapshot, rollback, analyze, history, clear-history.
 
 ## Prerequisites
 
 - BlackHole 2ch installed (virtual audio driver)
 - Ableton output routed to BlackHole 2ch in Preferences → Audio
 - LivePilot Remote Script running (port 9878)
-- Python deps in mlx-env: /Users/warrenhayes/mlx-env/bin/python (librosa, numpy, scipy, soundfile, pyloudnorm)
-- Reference profile at ~/.hermes/data/deepspace_reference_profile.json (31 deep techno tracks)
+- LivePilot Analyzer M4L device on master track (for bridge loop — port 9880/9881)
+- Python deps: /Users/warrenhayes/mlx-env/bin/python (librosa, numpy, scipy, soundfile, pyloudnorm)
+- Reference tracks at ~/Desktop/Deepspace reference tracks/ (31 deep techno tracks)
+- Profile cache at ~/.hermes/data/deepspace_per_track/ (30/31 pre-analyzed)
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `capture [seconds]` | Analyze only, print issues. Default 4s. |
-| `fix [seconds]` | One capture→analyze→apply cycle. Auto-snapshots. |
-| `loop [n] [seconds]` | n iterations with convergence tracking, time budgets, frozen scan. |
-| `roles` | Show all tracks with role classification. |
-| `scan` | Show all devices with role tags. |
-| `snapshot` | Save all device params for later rollback. |
-| `rollback` | Restore all params from last snapshot. |
-| `target <id> <preset>` | Apply preset to track by index, name, or role. |
-| `presets` | List all 10 available presets. |
-| `analyze <file>` | Compare WAV/MP3/FLAC file against reference. |
-| `history` | Show iteration history. |
-
-## Track Role Tagging (Issue #2)
+## Track Role Tagging
 
 **Convention: first word of track name = role tag.** Case-insensitive. Plurals handled. Trailing punctuation stripped.
 
-120+ valid tags across 7 categories:
+120+ valid tags across 7 categories. See mixing.py → ROLE_TO_CATEGORY.
 
-- **LOW END**: kick, kicks, bass, basses, bassline, sub, subs, rumble, rumbles, 808, 909, lowend, low, thump, weight, body
-- **HIGH FREQ**: hats, hat, ride, rides, cymbal, cymbals, crash, hihat, hihats, hh, openhat, closedhat, shimmer, sparkle, top, tops
-- **SYNTH**: synth, synths, pad, pads, chord, chords, lead, leads, hook, hooks, melody, melodies, arp, arps, arpeggio, stab, stabs, pluck, plucks, drone, drones, texture, textures, keys, key, organ, piano
-- **PERCUSSION**: perc, percs, percussion, toms, tom, conga, congas, clap, claps, snare, snares, shaker, shakers, rim, rims, rimshot, cowbell, tambourine, maraca, maracas, triangle, woodblock, block, drum, drums, click, clicks, transient
-- **SPATIAL**: fx, fxs, effect, effects, reverb, reverbs, delay, delays, echo, echoes, noise, noises, riser, risers, sweep, sweeps, wash, washes, atmosphere, ambience, ambient, space
-- **MIX BUS**: group, groups, bus, busses, buses, master, masters, mix, main, sum
-- **MID**: vox, vocal, vocals, voice, voices, sample, samples, chop, chops, phrase, phrases
+## Category Routing (v3)
 
-Example names: `kick punchy 808`, `hats 909 minimal`, `bass FM dark`, `pad warm chords`, `group drums`
+The loop routes fixes to the right track by spectral band → category:
 
-Untagged tracks are neutral fallback. Run `roles` command to audit.
+| Spectral band | Category | Example tracks |
+|---|---|---|
+| sub, bass | low_end | KICK, BASS, SUB, RUMBLE |
+| presence, air | hi_freq | HATS, RIDE, CYMBAL, SHIMMER |
+| low_mid, mid | synth, mid | PAD, LEAD, CHORD, VOX |
+| — | percussion | PERC, SNARE, CLAP, TOMS |
+| — | spatial | FX, REVERB, DELAY, NOISE |
 
-## Ratio-Based Spectral Comparison
+If no categorized track found, falls back to all unmuted tracks.
 
-Level-independent: compares band RELATIONSHIPS not absolute levels. Fixes the bug where quiet mixes (-20 LUFS) looked "weak" against mastered references (-7.5 LUFS).
+## Band-to-EQ-Filter Mapping
 
-Six adjacent-band ratios: sub/bass, bass/low_mid, low_mid/mid, mid/high_mid, high_mid/presence, presence/air.
+| Spectral band | EQ Eight filter | Frequency range |
+|---|---|---|
+| sub | 1 | 20-60Hz |
+| bass | 2 | 60-120Hz |
+| low_mid | 3 | 120-250Hz |
+| mid | 5 | 250-2000Hz |
+| high_mid | 6 | 2000-6000Hz |
+| presence | 7 | 6000-12000Hz |
+| air | 8 | 12000Hz+ |
 
-Recommendations: "Sub-to-bass gap is wide (8.5 dB vs ref 2.4 dB). Reduce sub or boost bass."
+## Q/Resonance Mapping
 
-Full details: `references/ratio-based-comparison.md`
+Wider spectral gap → wider Q (lower resonance) to cover more frequencies:
 
-## Greedy Single-Shot (Issue #3)
+| Sigmas | Q | Effect |
+|---|---|---|
+| >8σ | 0.15 | Very wide — whole region needs fixing |
+| 4-8σ | 0.30 | Wide |
+| 2-4σ | 0.50 | Medium |
+| 1-2σ | 0.70 | Surgical — narrow |
+| <1σ | (none) | Deadband — no adjustment |
 
-Instead of applying 7+ conflicting recommendations per iteration, finds the SINGLE biggest band deviation and applies ONE parameter fix. Eliminates oscillation. Cuts per-iteration LivePilot calls from 7×3s to 1×3s.
+## Reference Track Selection
 
-## Direct Track Targeting (Presets)
+```
+bridge_loop.py --list-refs              # Numbered list of all 31 tracks
+bridge_loop.py --refs 12,19,24 -n 30    # Run against 3 specific tracks
+bridge_loop.py -n 30                    # Run against all 31 (default)
+```
 
-`mix_loop.py target <id> <preset>` — apply preset to specific track. Matches by track index, track name (partial), or role tag. Auto-snapshots before applying.
-
-10 presets: aggressive, wider, darker, brighter, punchier, softer, bigger, tighter, warmer, clean.
-
-## Safety Features (V2)
-
-- **Role-based targeting**: Recommendations hit the right track by role tag
-- **Gain ceiling**: Parameters have hard maximums
-- **Deadband**: No adjustment within 0.8 sigma
-- **Proportional control**: Deltas shrink each iteration
-- **Red-line protection**: Blocks gain increases if peak > -0.5 dBFS
-- **Scan caching**: Device layout cached for 5 min
-- **Frozen scan**: One scan at loop start, reused across all iterations
-- **Time budgets**: 120s loop total, 20s per iteration (NASA Rule 2)
-- **Parameter verification**: Re-reads after set, detects REJECTED enum-step params (NASA Rule 7)
-- **Snapshot/rollback**: Auto-snapshot before fix/loop, rollback anytime
-- **RMS silence gate**: Exit early if capture is silent
-
-## Parameter Pitfalls
-
-- **batch_set_parameters** uses `name_or_index` key, NOT `name` or `index`
-- **Glue Compressor Attack/Ratio/Release** are ENUM steps: Attack={0-6}, Ratio={0-2}, Release={0-6}. Intermediate values silently fail. Our param verification detects this (reports REJECTED).
-- **Utility Gain** range is [-1, 1], maps to -∞ to +35dB
-- Always verify with get_device_parameters after setting
-- Returned `ok: true` does NOT guarantee the value changed
-
-## Current Track State
-
-Warren's cyber techno project (May 31, 2026):
-- 142 BPM, D Phrygian dominant, 30 tracks
-- Key tracks: KICK[1], 909-HARDCORE[2], BASS-FM[6], TRIBAL-SPACE[12], HARDGROOVE[15], HOOK[16], PAD-MIDI[23], TOMS[24], HATS-N-RIDES[25], CONGA-TRIBAL[26]
-- Most tracks route to 1-Group
-- Master: clean (no processing)
+Profile built instantly from per-track cache. 30/31 tracks pre-analyzed.
 
 ## Architecture (refactored June 2026)
 
 ```
-mixing.py        (350 lines) — pure logic, zero transport, shared library
-mix_loop.py      (380 lines) — raw TCP transport, standalone CLI
-audio_analyzer.py (520 lines) — analysis engine, unchanged
-orchestrator.py  (310 lines) — Hermes MCP transport
+mixing.py          (450 lines) — pure logic, zero transport, shared library
+bridge_loop.py     (850 lines) — async UDP receiver thread + TCP fallback
+mix_loop.py        (380 lines) — raw TCP transport, standalone CLI
+audio_analyzer.py  (520 lines) — analysis engine, unchanged
+orchestrator.py    (310 lines) — Hermes MCP transport
 ```
 
-- `mixing.py` — Role tagging, device matching, greedy algorithm, presets, safety limits. Importable by both transport layers.
-- `mix_loop.py` — Imports mixing.py. Raw TCP transport. Audio analysis subprocess. 14 CLI commands.
-- `audio_analyzer.py` — Spectral/dynamic/stereo/LUFS analysis, ratio-based comparison, reference profile. Zero Ableton dependency.
-- `orchestrator.py` — Imports mixing.py. Designed for Hermes MCP transport. Returns action plans — Hermes executes via MCP tools.
+## Safety Features
 
-API boundary: `capture` command produces JSON with band_issues, recommendations, analysis. Both transports consume the same JSON.
+- **Role-based targeting**: Recommendations hit the right track by role tag
+- **Gain ceiling**: Parameters have hard maximums (GAIN_CEILINGS)
+- **Deadband**: No adjustment within 0.8 sigma
+- **Proportional control**: Deltas shrink each iteration (PROPORTIONAL_GAIN)
+- **EQ8 bipolar clamp**: Gain values clamped [-1, 1] (EQ Eight is bipolar)
+- **Param cache**: Device params cached across iterations, updated after writes
+- **Snapshot/rollback**: mix_loop.py supports auto-snapshot and rollback
+- **ensure_device**: Adds EQ Eight/Utility via LivePilot insert_device if missing
 
-## LivePilot Patches (applied June 2026)
+## Parameter Pitfalls
 
-Optimizations to `~/Music/Ableton/User Library/Remote Scripts/LivePilot/`. Requires Ableton restart.
-
-| File | Command | Before | After |
-|------|---------|--------|-------|
-| `devices.py` | `get_all_device_parameters` | 30+ calls (150s) | 1 call (~3s) |
-| `tracks.py` | `get_all_track_names` | 30 calls (90s) | 1 call (~1s) |
-| `server.py` | FAST_WRITE_COMMANDS | 100ms settle delay | 0ms (instant) |
-| `mix_loop.py` | response value verify | read(3s) + write(3s) = 6s | write(3s) = 3s |
-
-`set_device_parameter` returns actual parameter value in response — we use it for verification instead of a separate `get_device_parameters` call. All scripts auto-detect patches and fall back gracefully.
-
-Patches archived at: `livepilot_devices_patch.py`, `livepilot_tracks_patch.py`, `livepilot_server_patch.py` in repo.
-
-See `references/architecture-transport.md` for full details.
-
-### References
-
-- `references/livepilot-patches.md` — Three LivePilot Remote Script optimizations (get_all_device_parameters, get_all_track_names, FAST_WRITE_COMMANDS). Restart Ableton to activate. Reduces scan from 150s to ~3s.
+- **EQ Eight gain is bipolar** [-1, +1], NOT unipolar [0, 1]. Clamping to 0 floors negative values.
+- **Glue Compressor Attack/Ratio/Release** are ENUM steps (0-6, 0-2, 0-6). Intermediate values silently fail.
+- **Utility Gain** range is [-1, 1], maps to -∞ to +35dB
+- Always verify with get_device_parameters after setting
+- Returned `ok: true` does NOT guarantee the value changed
 
 ## Known Limitations
 
-- LivePilot TCP calls take ~3s each — initial scan is slow (cached after first run)
-- Device matching may target wrong track if no role tags are set
-- Reference profile is 31 mastered deep techno tracks at -7.5 LUFS
-- Ratio-based comparison helps but mastered vs unmastered is never exact
+- Bridge spectral at 50Hz is too noisy to detect <0.05 gain changes reliably
+- Oscillation between IMPROVING/WORSE on small deltas
+- Reference profile is static — no live reference capture yet
+- No subjective override channel ("hats too dull") yet
+- LivePilot TCP calls take ~3s — initial device discovery is slow
