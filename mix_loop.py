@@ -123,6 +123,61 @@ def compare_file(filepath, profile_path=PROFILE):
     return json.loads(r.stdout)
 
 
+# ─── Role-based track targeting ───
+# Convention: first word of track name = role tag
+# e.g., "kick punchy 808" → role=kick, "bass FM dark" → role=bass
+
+ROLE_TO_CATEGORY = {
+    "kick": "low_end", "bass": "low_end", "sub": "low_end", "rumble": "low_end", "808": "low_end",
+    "hats": "hi_freq", "hat": "hi_freq", "ride": "hi_freq", "cymbal": "hi_freq", "hihat": "hi_freq",
+    "synth": "synth", "pad": "synth", "chord": "synth", "lead": "synth",
+    "hook": "synth", "melody": "synth", "arp": "synth",
+    "perc": "percussion", "toms": "percussion", "tom": "percussion",
+    "conga": "percussion", "clap": "percussion", "snare": "percussion", "shaker": "percussion",
+    "fx": "spatial", "reverb": "spatial", "delay": "spatial",
+    "echo": "spatial", "noise": "spatial", "riser": "spatial", "sweep": "spatial",
+    "group": "mix_bus", "bus": "mix_bus", "master": "mix_bus", "mix": "mix_bus",
+    "vox": "mid", "vocal": "mid", "voice": "mid", "sample": "mid",
+}
+
+CATEGORY_TARGETS = {
+    "low_end": ["sub frequencies", "bass (60-120hz)"],
+    "hi_freq": ["presence (2-6khz)", "air (6-16khz)"],
+    "synth": ["low-mids", "presence (2-6khz)", "narrow", "widen"],
+    "percussion": ["presence (2-6khz)"],
+    "spatial": ["air (6-16khz)", "narrow"],
+    "mix_bus": ["master is too quiet", "master is loud", "reduce master", "raise master",
+                "over-compressed", "very dynamic", "more compression",
+                "limited dynamic range"],
+    "mid": ["low-mids", "presence (2-6khz)"],
+}
+
+
+def parse_track_role(track_name):
+    """Extract role tag from first word of track name. Returns role or None."""
+    if not track_name:
+        return None
+    first_word = track_name.strip().split()[0].lower()
+    for suffix in ["-", "_", ".", ":"]:
+        if first_word.endswith(suffix):
+            first_word = first_word[:-1]
+    return first_word if first_word in ROLE_TO_CATEGORY else None
+
+
+def get_track_category(track_name):
+    """Get target category for a track based on its role tag."""
+    role = parse_track_role(track_name)
+    return ROLE_TO_CATEGORY.get(role) if role else None
+
+
+def category_matches_recommendation(category, rec_text):
+    """Does this category target this recommendation text?"""
+    if not category or category not in CATEGORY_TARGETS:
+        return False
+    rec_lower = rec_text.lower()
+    return any(target.lower() in rec_lower for target in CATEGORY_TARGETS[category])
+
+
 # ─── Device discovery (project-agnostic) ───
 
 # Device types we care about for mixing adjustments
@@ -250,18 +305,45 @@ def fetch_device_params(track_idx, device_idx):
 
 # ─── Smart recommendation → device matching ───
 
-def find_device(session_devices, device_types, exclude_muted=True):
-    """Find first device matching any of device_types.
-    Returns (track_idx, device_idx, device_name, track_name) or None.
-    Use fetch_device_params() to get actual parameter values afterwards."""
+def find_device(session_devices, device_types, rec_text=None, exclude_muted=True):
+    """Find best device matching device_types, preferring tracks whose role
+    category matches the recommendation text.
+    - rec_text: the recommendation text (e.g., "Sub frequencies are weak")
+    - If rec_text is None: fall back to first match (backwards compatible)
+    """
+    # Backwards compat: no rec_text → return first match
+    if rec_text is None:
+        for d in session_devices:
+            if exclude_muted and d.get("track_muted"):
+                continue
+            dname_lower = d["device_name"].lower()
+            if any(dt.lower() in dname_lower for dt in device_types):
+                return (d["track_idx"], d["device_idx"],
+                        d["device_name"], d["track_name"])
+        return None
+
+    matches = []
     for d in session_devices:
         if exclude_muted and d.get("track_muted"):
             continue
         dname_lower = d["device_name"].lower()
         if any(dt.lower() in dname_lower for dt in device_types):
-            return (d["track_idx"], d["device_idx"],
-                    d["device_name"], d["track_name"])
-    return None
+            category = get_track_category(d["track_name"])
+            if category and category_matches_recommendation(category, rec_text):
+                score = 2
+            elif category is None:
+                score = 1  # untagged — neutral, use as fallback
+            else:
+                score = 0  # tagged but wrong category
+            matches.append((score, d))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda x: (-x[0], x[1]["track_idx"]))
+    best = matches[0][1]
+    return (best["track_idx"], best["device_idx"],
+            best["device_name"], best["track_name"])
 
 
 def find_param_in_device(params, param_hints):
@@ -404,6 +486,7 @@ def apply_smart(session_devices, recommendations, iteration=0, peak_db=None):
                 match = find_device(
                     session_devices,
                     fix["devices"],
+                    rec_text=rec_text,
                     exclude_muted=True
                 )
                 if not match:
@@ -689,17 +772,47 @@ def main():
             print(json.dumps(analysis, indent=2))
 
     elif cmd == "scan":
-        """Show all devices in current session."""
-        session = scan_session()
+        """Show all devices in current session with role classification."""
+        session = scan_session(fast=True)
         if not session:
             print("ERROR: Cannot reach LivePilot")
             sys.exit(1)
         print(f"Tempo: {session['tempo']} BPM, {session['track_count']} tracks, {len(session['devices'])} devices\n")
         for d in session["devices"]:
             muted = " (MUTED)" if d["track_muted"] else ""
-            params = list(d["params"].keys())[:5]
-            print(f"  [{d['track_idx']}] {d['track_name']}{muted} → {d['device_name']}")
-            print(f"       Params: {', '.join(params)}")
+            role = parse_track_role(d["track_name"])
+            cat = get_track_category(d["track_name"]) or "-"
+            role_str = f" role={role}" if role else ""
+            print(f"  [{d['track_idx']:2d}] {d['track_name']}{muted}{role_str} [{cat}] → {d['device_name']}")
+
+    elif cmd == "roles":
+        """Show all tracks with their role classification."""
+        r = lp_call("get_session_info", timeout=3)
+        if not r.get("ok"):
+            print("ERROR: Cannot reach LivePilot")
+            sys.exit(1)
+        tc = r["result"]["track_count"]
+        print(f"{'Idx':4s} {'Track Name':30s} {'Role':10s} {'Category':12s} {'Tagged?'}")
+        print("-" * 70)
+        tagged = untagged = 0
+        for ti in range(tc):
+            t = lp_call("get_track_info", {"track_index": ti}, timeout=3)
+            if not t.get("ok"):
+                continue
+            name = t["result"].get("name", "?")
+            role = parse_track_role(name)
+            cat = get_track_category(name) or "-"
+            status = "✓" if role else "✗ (add role prefix)"
+            if role:
+                tagged += 1
+            else:
+                untagged += 1
+            print(f"  [{ti:2d}] {name:30s} {role or '-':10s} {cat:12s} {status}")
+        print("-" * 70)
+        print(f"  {tagged} tagged, {untagged} untagged")
+        if untagged > 0:
+            print("\n  Convention: first word of track name = role tag.")
+            print("  Valid roles: " + ", ".join(sorted(ROLE_TO_CATEGORY.keys())))
 
     elif cmd == "history":
         history = load_history()
@@ -714,7 +827,7 @@ def main():
 
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|history|clear-history]")
+        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|roles|history|clear-history]")
         sys.exit(1)
 
 
