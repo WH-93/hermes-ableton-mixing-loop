@@ -35,9 +35,9 @@ MIXING = os.path.expanduser("~/.hermes/scripts")
 sys.path.insert(0, MIXING)
 
 from mixing import (
-    find_biggest_deviation, map_band_to_fix,
+    find_biggest_deviation, map_band_to_fix, scale_delta_for_sigmas,
     ROLE_TO_CATEGORY, parse_track_role, get_track_category, category_matches_recommendation,
-    GAIN_CEILINGS, GAIN_FLOORS, PROPORTIONAL_GAIN,
+    GAIN_CEILINGS, GAIN_FLOORS, PROPORTIONAL_GAIN, SKIP_BRIDGE_THRESHOLD,
 )
 
 BRIDGE_RX = 9880
@@ -526,15 +526,34 @@ def get_resonance_index(ti, di, gain_param_name):
 
 _last_validation_deviation = None  # (band, direction, sigmas) from last BlackHole check
 _last_validation_spectral = None   # bridge spectral at time of validation
+_stuck_counter = 0                 # consecutive iterations on same band+direction
+_stuck_band = None                 # band+direction we're stuck on
+MAX_STUCK_ITERATIONS = 5           # escalate after this many stuck iterations
 
 
 def set_validation_ground_truth(comparison_result, current_spectral=None):
     """Called after each BlackHole validation to set the ground truth target."""
-    global _last_validation_deviation, _last_validation_spectral
+    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _stuck_band
     if not comparison_result or 'error' in comparison_result:
         return
     band_issues = comparison_result.get('band_issues', [])
-    _last_validation_deviation = find_biggest_deviation(band_issues)
+    new_deviation = find_biggest_deviation(band_issues)
+
+    # Check if we made progress since last validation
+    if _last_validation_deviation and new_deviation:
+        old_band, old_dir, old_sigmas = _last_validation_deviation
+        new_band, new_dir, new_sigmas = new_deviation
+        if old_band == new_band and old_dir == new_dir:
+            if new_sigmas < old_sigmas:
+                print(f"     ✓ improved: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
+                _stuck_counter = 0
+            elif new_sigmas >= old_sigmas * 1.1:
+                print(f"     ✗ worse: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
+                _stuck_counter += 1
+            else:
+                _stuck_counter += 1
+
+    _last_validation_deviation = new_deviation
     if current_spectral and _last_validation_deviation:
         _last_validation_spectral = list(current_spectral)
 
@@ -575,7 +594,7 @@ def checkpoint_spectral(spectral):
 # ═══════════════════════════════════════════
 
 def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
-    global _last_validation_deviation, _last_validation_spectral
+    global _last_validation_deviation, _last_validation_spectral, _stuck_counter
     profile_path = profile_path or PROFILE
 
     print("═" * 60)
@@ -647,6 +666,13 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
             time.sleep(0.005)
             continue
 
+        # ── Spawn validation if due ──
+        if (i + 1) % validate_every == 0 and validation is None:
+            validation = AsyncValidation(profile_path)
+            validation.start()
+            print(f"  ⏳ BlackHole validation started (will resolve in ~5s)...")
+            applied_fix = False  # reset — ground truth about to refresh
+
         # ── If no ground truth yet, skip analysis ──
         if _last_validation_deviation is None:
             # Validation takes ~5s — slow poll until it finishes
@@ -666,8 +692,89 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
 
         target_band, target_direction, target_sigmas = _last_validation_deviation
 
-        # ── Check direction of movement ──
+        # ── Above threshold: skip bridge direction, apply aggressively ──
+        if target_sigmas >= SKIP_BRIDGE_THRESHOLD:
+            # Bridge can't reliably detect <0.1 changes — just apply and verify on next validation
+            stuck_label = f" [STUCK x{_stuck_counter}]" if _stuck_counter >= MAX_STUCK_ITERATIONS else ""
+            print(f"[{i+1:3d}] 🚀 {target_band:10s} {target_direction:4s} ({target_sigmas:.0f}σ) aggressive{stuck_label}  ({time.time()-t0:.3f}s)")
+
+            # If stuck, try second fix action or different track
+            fix_idx = 1 if _stuck_counter >= MAX_STUCK_ITERATIONS else 0
+            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i)
+            if fix:
+                # If stuck, try next candidate track
+                stuck_offset = _stuck_counter // MAX_STUCK_ITERATIONS
+                scored = []
+                for t in track_names:
+                    if t.get('mute'):
+                        continue
+                    cat = get_track_category(t['name'])
+                    role = parse_track_role(t['name'])
+                    if role and role == target_band:
+                        score = 5
+                    elif cat and category_matches_recommendation(cat, rec_text):
+                        score = 2
+                    elif cat is None:
+                        score = 0
+                    else:
+                        continue
+                    score += (len(track_names) - t['index']) * 0.01
+                    scored.append((score, t))
+                scored.sort(key=lambda x: -x[0])
+                candidates = [s[1] for s in scored[:5]]
+                if not candidates:
+                    candidates = [t for t in track_names if not t.get('mute')]
+
+                # Pick candidate based on stuck offset (cycle through top matches)
+                cand = candidates[min(stuck_offset, len(candidates) - 1)]
+                match = None
+                devs = get_track_devices(cand['index'])
+                for dev in devs:
+                    if any(dt.lower() in dev['name'].lower() for dt in fix['devices']):
+                        match = (cand['index'], dev['index'], dev['name'], cand['name'])
+                        break
+
+                if match:
+                    ti, di, dname, tname = match
+                    pidx, pname = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
+                    if pidx is None:
+                        pidx, pname = get_cached_param_index(ti, di, fix['params'])
+                    if pidx is not None:
+                        key = (ti, di)
+                        current_val = 0.5
+                        if key in _param_cache:
+                            for _pn, pinfo in _param_cache[key].items():
+                                if pinfo['index'] == pidx:
+                                    current_val = pinfo['value']
+                                    break
+                        delta = scale_delta_for_sigmas(fix['delta_base'], target_sigmas)
+                        new_val = max(-1.0, min(1.0, current_val + delta))
+
+                        # Detect ceiling/floor hit — no room to move
+                        if abs(new_val - current_val) < 0.001:
+                            print(f"     ⚠ {dname}({tname}) {pname} at limit ({current_val:.2f}) — stuck")
+                            _stuck_counter += 1
+                        else:
+                            bridge.set_param(ti, di, pidx, new_val)
+                            if key in _param_cache:
+                                for _pn, pinfo in _param_cache[key].items():
+                                    if pinfo['index'] == pidx:
+                                        pinfo['value'] = new_val
+                                        break
+                            q_val = sigmas_to_q(target_sigmas)
+                            if q_val is not None:
+                                ridx = get_resonance_index(ti, di, pname)
+                                if ridx is not None:
+                                    bridge.set_param(ti, di, ridx, q_val)
+                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val or '-'}")
+                            _stuck_counter = 0
+            time.sleep(0.2)  # cooldown for aggressive mode
+            prev_spectral = spectral
+            continue
+
+        # ── Normal mode: check bridge direction ──
         movement = get_band_direction(spectral, target_band)
+        # (rest of existing movement logic continues below...)
 
         if movement == 'improving':
             print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} IMPROVING  ({time.time()-t0:.3f}s)")
@@ -680,10 +787,28 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
             # Apply the fix
             fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i)
             if fix:
-                candidates = [t for t in track_names
-                            if not t.get('mute')
-                            and get_track_category(t['name'])
-                            and category_matches_recommendation(get_track_category(t['name']), rec_text)]
+                # Score candidates: prefer tracks whose role tag matches the band name
+                # "bass" fixes should prefer "bass BASS-FM" over "KICK"
+                scored = []
+                for t in track_names:
+                    if t.get('mute'):
+                        continue
+                    cat = get_track_category(t['name'])
+                    role = parse_track_role(t['name'])
+                    # Score: role matches band name → 5, same category → 2, untagged → 0
+                    if role and role == target_band:
+                        score = 5
+                    elif cat and category_matches_recommendation(cat, rec_text):
+                        score = 2
+                    elif cat is None:
+                        score = 0
+                    else:
+                        continue  # wrong category entirely
+                    # Bonus: lower track index (earlier in chain) → +0.1
+                    score += (len(track_names) - t['index']) * 0.01
+                    scored.append((score, t))
+                scored.sort(key=lambda x: -x[0])
+                candidates = [s[1] for s in scored[:5]]
                 if not candidates:
                     candidates = [t for t in track_names if not t.get('mute')]
 
@@ -717,7 +842,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                             if pinfo['index'] == pidx:
                                 current_val = pinfo['value']
                                 break
-                    delta = fix['delta_base'] * PROPORTIONAL_GAIN
+                    delta = scale_delta_for_sigmas(fix['delta_base'], target_sigmas)
                     new_val = max(-1.0, min(1.0, current_val + delta))  # EQ8 gain is bipolar
                     bridge.set_param(ti, di, pidx, new_val)
                     # Update cache so next read shows the new value
@@ -742,7 +867,12 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                     last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
                     checkpoint_spectral(spectral)  # baseline BEFORE fix
                     applied_fix = True
-                    time.sleep(0.05)  # cooldown: let bridge stream 2-3 frames
+
+                    # Above threshold: skip bridge direction check — apply and trust
+                    if target_sigmas >= SKIP_BRIDGE_THRESHOLD:
+                        time.sleep(0.2)  # longer cooldown for aggressive moves
+                    else:
+                        time.sleep(0.05)  # standard cooldown
                 else:
                     print(f"     ⚠ no matching device for {rec_text}")
             else:
@@ -775,13 +905,6 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
 
         prev_spectral = spectral
         time.sleep(0.005)  # prevent CPU spin; bridge streams at ~50Hz
-
-        # ── Spawn validation if due ──
-        if (i + 1) % validate_every == 0 and validation is None:
-            validation = AsyncValidation(profile_path)
-            validation.start()
-            print(f"  ⏳ BlackHole validation started (will resolve in ~5s)...")
-            applied_fix = False  # reset — ground truth about to refresh
 
     # ── Cleanup ──
     print(f"\n{'═'*60}")

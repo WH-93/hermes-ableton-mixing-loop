@@ -42,6 +42,9 @@ GAIN_FLOORS = {
 REDLINE_PEAK_DB = -0.5
 DEADBAND_SIGMAS = 0.8
 PROPORTIONAL_GAIN = 0.5
+SKIP_BRIDGE_THRESHOLD = 20   # sigmas above which bridge direction is noise — skip verification
+SIGMA_SCALE_MIN = 1.0        # minimum delta multiplier
+SIGMA_SCALE_MAX = 5.0        # maximum delta multiplier at 20σ+
 LOOP_TIME_BUDGET = 120
 ITER_TIME_BUDGET = 20
 
@@ -272,6 +275,14 @@ def find_biggest_deviation(band_issues):
         return None
     biggest = max(significant, key=lambda b: b["sigmas"])
     return (biggest["band"], biggest["direction"], biggest["sigmas"])
+
+
+def scale_delta_for_sigmas(delta_base, sigmas):
+    """Scale fix delta by sigma magnitude.
+    2σ → 1x delta, 8σ → 2x, 20σ+ → 5x delta.
+    Big gaps get aggressive moves; small gaps stay surgical."""
+    scale = max(SIGMA_SCALE_MIN, min(SIGMA_SCALE_MAX, sigmas / 4.0))
+    return delta_base * scale
 
 
 def map_band_to_fix(band, direction, iteration=0):
