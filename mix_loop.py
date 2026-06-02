@@ -662,17 +662,25 @@ def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
     prop_factor = PROPORTIONAL_GAIN / (1 + iteration * 0.3)
     redline_active = peak_db is not None and peak_db > REDLINE_PEAK_DB
 
+    # For ratio issues ("sub/bass"), map to the lower band's weak/hot
+    if "/" in band:
+        lower_band = band.split("/")[0]
+        band_direction = "hot" if direction == "wide" else "weak"
+    else:
+        lower_band = band
+        band_direction = direction
+
     # Map band → recommendation text for device matching
     band_to_rec = {
-        "sub": "sub frequencies" if direction == "weak" else "sub is hot",
-        "bass": "bass (60-120hz) is weak" if direction == "weak" else "bass (60-120hz) is hot",
-        "low_mid": "low-mids are thin" if direction == "weak" else "low-mids are muddy",
-        "mid": "mid range is weak" if direction == "weak" else "mid range is hot",
-        "high_mid": "high-mids are weak" if direction == "weak" else "high-mids are hot",
-        "presence": "presence is dull" if direction == "weak" else "presence is harsh",
-        "air": "air is missing" if direction == "weak" else "air is harsh",
+        "sub": "sub frequencies" if band_direction == "weak" else "sub is hot",
+        "bass": "bass (60-120hz) is weak" if band_direction == "weak" else "bass (60-120hz) is hot",
+        "low_mid": "low-mids are thin" if band_direction == "weak" else "low-mids are muddy",
+        "mid": "mid range is weak" if band_direction == "weak" else "mid range is hot",
+        "high_mid": "high-mids are weak" if band_direction == "weak" else "high-mids are hot",
+        "presence": "presence is dull" if band_direction == "weak" else "presence is harsh",
+        "air": "air is missing" if band_direction == "weak" else "air is harsh",
     }
-    rec_text = band_to_rec.get(band)
+    rec_text = band_to_rec.get(lower_band)
     if not rec_text:
         return [f"Iter[{iteration}]: Unknown band '{band}' — cannot fix"]
 
@@ -728,7 +736,6 @@ def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
     status = "OK" if r.get("ok") else "FAIL"
 
     # NASA Rule 7: verify the value actually changed
-    # LivePilot can return ok:true for enum-step params that silently reject
     if status == "OK":
         verify_params = fetch_device_params(ti, di)
         v_match = find_param_in_device(verify_params, [pname])
@@ -736,12 +743,13 @@ def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
             _, _, actual_val = v_match
             if abs(actual_val - new_val) > 0.01:
                 status = "REJECTED"
-                new_val = actual_val  # report what it actually is
+                new_val = actual_val
 
+    ratio_info = f" [{band} {direction}]" if "/" in band else ""
     return [
         f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → "
         f"{dname}({tname}) {pname}: {current:.3f}→{new_val:.3f} "
-        f"(Δ{delta:+.3f}) [{status}]",
+        f"(Δ{delta:+.3f}){ratio_info} [{status}]",
     ]
 
 

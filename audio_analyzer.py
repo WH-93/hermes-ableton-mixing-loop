@@ -358,6 +358,66 @@ def compare_track(analysis: dict, profile: dict) -> dict:
 
     issues.append({"band_levels": band_issues})
 
+    # ─── Ratio-based spectral comparison ───
+    # Level-independent: compares band RELATIONSHIPS not absolute levels.
+    # Fixes the "LUFS gap" bug where quiet mixes looked spectrally weak.
+    adjacent_pairs = [
+        ("sub", "bass", "Sub-to-bass"),
+        ("bass", "low_mid", "Bass-to-low-mid"),
+        ("low_mid", "mid", "Low-mid-to-mid"),
+        ("mid", "high_mid", "Mid-to-high-mid"),
+        ("high_mid", "presence", "High-mid-to-presence"),
+        ("presence", "air", "Presence-to-air"),
+    ]
+    for lower_band, upper_band, label in adjacent_pairs:
+        if lower_band not in track_bands or upper_band not in track_bands:
+            continue
+        if lower_band not in ref_bands or upper_band not in ref_bands:
+            continue
+        
+        # Track: how much lower_band exceeds upper_band (dB)
+        track_ratio = track_bands[lower_band] - track_bands[upper_band]
+        
+        # Reference: median ratio (not median of ratios — median of lower - median of upper)
+        ref_ratio = ref_bands[lower_band]["median"] - ref_bands[upper_band]["median"]
+        
+        # Std of the ratio: propagate errors (sqrt of sum of variances)
+        ref_std_ratio = ((ref_bands[lower_band]["std"] ** 2 + 
+                          ref_bands[upper_band]["std"] ** 2) ** 0.5)
+        
+        dev = track_ratio - ref_ratio
+        sigmas = abs(dev) / (ref_std_ratio + 1e-6)
+        direction = "wide" if dev > 0 else "narrow"
+        
+        if sigmas > 2.0:
+            band_issues.append({
+                "band": f"{lower_band}/{upper_band}",
+                "type": "ratio",
+                "lower_band": lower_band,
+                "upper_band": upper_band,
+                "label": label,
+                "track_ratio_db": round(track_ratio, 1),
+                "reference_ratio_db": round(ref_ratio, 1),
+                "deviation_db": round(dev, 1),
+                "sigmas": round(sigmas, 1),
+                "direction": direction,
+                "severity": "high",
+            })
+        elif sigmas > 1.0:
+            band_issues.append({
+                "band": f"{lower_band}/{upper_band}",
+                "type": "ratio",
+                "lower_band": lower_band,
+                "upper_band": upper_band,
+                "label": label,
+                "track_ratio_db": round(track_ratio, 1),
+                "reference_ratio_db": round(ref_ratio, 1),
+                "deviation_db": round(dev, 1),
+                "sigmas": round(sigmas, 1),
+                "direction": direction,
+                "severity": "medium",
+            })
+
     # generate recommendations
     for issue in issues:
         if "parameter" not in issue:
@@ -419,6 +479,21 @@ def compare_track(analysis: dict, profile: dict) -> dict:
             recommendations.append("Air (6-16kHz) is harsh. Reduce hat highs, tame reverb tails, LP filter high elements.")
         elif band == "air" and direction == "weak":
             recommendations.append("Air (6-16kHz) is missing. Open hat filters, boost high shelf on master, add shimmer reverb.")
+        # Ratio-based band recs — keep these unambiguous
+        elif "/" in band:
+            # Ratio issues: suggest checking the lower band first (usually the louder one)
+            bi_lower = bi.get("lower_band", "lower")
+            bi_upper = bi.get("upper_band", "upper")
+            if direction == "wide":
+                recommendations.append(
+                    f"{bi.get('label', band)} gap is wide "
+                    f"({bi.get('track_ratio_db', 0):.1f} dB vs ref {bi.get('reference_ratio_db', 0):.1f} dB). "
+                    f"Reduce {bi_lower} or boost {bi_upper}.")
+            else:
+                recommendations.append(
+                    f"{bi.get('label', band)} gap is narrow "
+                    f"({bi.get('track_ratio_db', 0):.1f} dB vs ref {bi.get('reference_ratio_db', 0):.1f} dB). "
+                    f"Boost {bi_lower} or reduce {bi_upper}.")
 
     return {"issues": issues, "band_issues": band_issues, "recommendations": recommendations[:8]}
 
