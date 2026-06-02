@@ -35,6 +35,7 @@ PYTHON = "/Users/warrenhayes/mlx-env/bin/python"
 ANALYZER = os.path.expanduser("~/.hermes/scripts/audio_analyzer.py")
 PROFILE = os.path.expanduser("~/.hermes/data/deepspace_reference_profile.json")
 HISTORY = os.path.expanduser("~/.hermes/data/mix_loop_history.json")
+SNAPSHOT = os.path.expanduser("~/.hermes/data/mix_loop_snapshot.json")
 LP_HOST = "127.0.0.1"
 LP_PORT = 9878
 
@@ -764,6 +765,63 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 
+def take_snapshot(session_devices):
+    """Save all device parameter values to JSON. Returns count of params saved."""
+    snap = {"_ts": time.time(), "_count": 0, "params": {}}
+    for d in session_devices:
+        params = fetch_device_params(d["track_idx"], d["device_idx"])
+        for pname, pinfo in params.items():
+            key = f"{d['track_name']}/{d['device_name']}/{pname}"
+            snap["params"][key] = {
+                "track_idx": d["track_idx"],
+                "device_idx": d["device_idx"],
+                "param_index": pinfo["index"],
+                "value": pinfo["value"],
+            }
+            snap["_count"] += 1
+    os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
+    with open(SNAPSHOT, "w") as f:
+        json.dump(snap, f, indent=2)
+    return snap["_count"]
+
+
+def rollback_snapshot():
+    """Restore all parameters from last snapshot. Returns list of changes."""
+    if not os.path.exists(SNAPSHOT):
+        return ["No snapshot found. Run 'snapshot' first."]
+
+    with open(SNAPSHOT) as f:
+        snap = json.load(f)
+
+    results = []
+    restored = 0
+    for key, info in snap.get("params", {}).items():
+        r = lp_call("set_device_parameter", {
+            "track_index": info["track_idx"],
+            "device_index": info["device_idx"],
+            "parameter_index": info["param_index"],
+            "value": info["value"],
+        }, timeout=5)
+        if r.get("ok"):
+            restored += 1
+        else:
+            results.append(f"FAIL: {key}")
+
+    age = time.time() - snap.get("_ts", 0)
+    results.insert(0, f"Rollback: {restored}/{snap['_count']} params restored "
+                   f"(snapshot from {age:.0f}s ago)")
+    return results
+
+
+def auto_snapshot(session_devices):
+    """Take snapshot before fix/loop if none exists. Returns True if new snapshot taken."""
+    if not os.path.exists(SNAPSHOT):
+        count = take_snapshot(session_devices)
+        print(f"  Auto-snapshot: saved {count} params to {SNAPSHOT}", file=sys.stderr)
+        return True
+    return False
+
+
 def run_loop(iterations=5, duration=4):
     """Run capture→analyze→apply loop with convergence tracking.
     NASA Rule 2: hard time budgets prevent unbounded execution.
@@ -787,6 +845,8 @@ def run_loop(iterations=5, duration=4):
     session_devices = session["devices"]
     print(f"  {len(session_devices)} devices frozen across {session['track_count']} tracks\n",
           file=sys.stderr)
+
+    auto_snapshot(session_devices)
 
     for i in range(iterations):
         # NASA Rule 2: total time budget
@@ -961,6 +1021,7 @@ def main():
             print(f"\nScanning session (fast)...", file=sys.stderr)
             session = scan_session(fast=True)
             if session:
+                auto_snapshot(session["devices"])
                 print(f"Found {len(session['devices'])} devices on {session['track_count']} tracks", file=sys.stderr)
                 results = apply_greedy(session["devices"], band_issues, 0, peak)
             else:
@@ -1053,9 +1114,22 @@ def main():
         else:
             print("No history file.")
 
+    elif cmd == "snapshot":
+        session = scan_session(fast=True)
+        if not session:
+            print("ERROR: Cannot reach LivePilot")
+            sys.exit(1)
+        count = take_snapshot(session["devices"])
+        print(f"Snapshot saved: {count} parameters from {len(session['devices'])} devices → {SNAPSHOT}")
+
+    elif cmd == "rollback":
+        results = rollback_snapshot()
+        for line in results:
+            print(line)
+
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|roles|history|clear-history]")
+        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|roles|snapshot|rollback|history|clear-history]")
         sys.exit(1)
 
 
