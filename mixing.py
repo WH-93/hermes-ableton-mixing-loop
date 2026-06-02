@@ -154,7 +154,17 @@ def category_matches_recommendation(category, rec_text):
     if not category or category not in CATEGORY_TARGETS:
         return False
     rec_lower = rec_text.lower()
-    return any(target.lower() in rec_lower for target in CATEGORY_TARGETS[category])
+    for target in CATEGORY_TARGETS[category]:
+        target_lower = target.lower()
+        # Bidirectional: target in rec OR rec terms in target
+        if target_lower in rec_lower:
+            return True
+        # Check if any word from rec_text appears in target
+        rec_words = set(rec_lower.replace('(', '').replace(')', '').replace('-', ' ').split())
+        target_words = set(target_lower.replace('(', '').replace(')', '').replace('-', ' ').split())
+        if rec_words & target_words:
+            return True
+    return False
 
 
 # ─── Device matching ───

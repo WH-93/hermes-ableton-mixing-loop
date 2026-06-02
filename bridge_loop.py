@@ -419,6 +419,30 @@ def get_track_names():
     r = tcp_call('get_all_track_names', timeout=10)
     return r['result']['tracks'] if r.get('ok') else []
 
+def ensure_device(ti, device_name):
+    """Ensure a native Live device exists on the track. Adds it if missing.
+    Returns the device index, or -1 on failure."""
+    devs = get_track_devices(ti)
+    for d in devs:
+        if device_name.lower() in d['name'].lower():
+            return d['index']
+
+    # Not found — insert via LivePilot
+    print(f"     ＋ adding {device_name} to track {ti}...", end='', flush=True)
+    r = tcp_call('insert_device', {'track_index': ti, 'device_name': device_name}, timeout=10)
+    if r.get('ok'):
+        # Invalidate cache so next get_track_devices re-fetches
+        if ti in _track_cache:
+            del _track_cache[ti]
+        devs = get_track_devices(ti)
+        for d in devs:
+            if device_name.lower() in d['name'].lower():
+                print(f" ✓ (index {d['index']})")
+                return d['index']
+    print(f" ✗ failed: {r.get('error', r)}")
+    return -1
+
+
 def get_track_devices(ti):
     if ti in _track_cache:
         return _track_cache[ti]
@@ -675,37 +699,50 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                 if match:
                     ti, di, dname, tname = match
                     pidx, pname = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
-                    if pidx is not None:
-                        # Get current value for relative adjustment
-                        key = (ti, di)
-                        current_val = 0.5  # default midpoint
-                        if key in _param_cache:
-                            for _pn, pinfo in _param_cache[key].items():
-                                if pinfo['index'] == pidx:
-                                    current_val = pinfo['value']
-                                    break
-                        delta = fix['delta_base'] * PROPORTIONAL_GAIN
-                        new_val = max(0.0, min(1.0, current_val + delta))
-                        bridge.set_param(ti, di, pidx, new_val)
 
-                        # ── Q adjustment: wider gap → wider Q (lower resonance) ──
-                        q_val = sigmas_to_q(target_sigmas)
-                        if q_val is not None:
-                            ridx = get_resonance_index(ti, di, pname)
-                            if ridx is not None:
-                                bridge.set_param(ti, di, ridx, q_val)
-                                print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val:.2f}")
-                            else:
-                                print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
+                    if pidx is None:
+                        # Try generic 'gain' match as fallback (e.g. 'Output Gain')
+                        pidx, pname = get_cached_param_index(ti, di, fix['params'])
+                        if pidx is not None:
+                            print(f"     ⚠ band '{target_band}' param not found, using '{pname}' fallback")
+                        else:
+                            print(f"     ⚠ no matching param in {dname} (band '{target_band}')")
+                            continue
+
+                    # Get current value for relative adjustment
+                    key = (ti, di)
+                    current_val = 0.5  # default midpoint
+                    if key in _param_cache:
+                        for _pn, pinfo in _param_cache[key].items():
+                            if pinfo['index'] == pidx:
+                                current_val = pinfo['value']
+                                break
+                    delta = fix['delta_base'] * PROPORTIONAL_GAIN
+                    new_val = max(-1.0, min(1.0, current_val + delta))  # EQ8 gain is bipolar
+                    bridge.set_param(ti, di, pidx, new_val)
+                    # Update cache so next read shows the new value
+                    if key in _param_cache:
+                        for _pn, pinfo in _param_cache[key].items():
+                            if pinfo['index'] == pidx:
+                                pinfo['value'] = new_val
+                                break
+
+                    # ── Q adjustment: wider gap → wider Q (lower resonance) ──
+                    q_val = sigmas_to_q(target_sigmas)
+                    if q_val is not None:
+                        ridx = get_resonance_index(ti, di, pname)
+                        if ridx is not None:
+                            bridge.set_param(ti, di, ridx, q_val)
+                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val:.2f}")
                         else:
                             print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
-
-                        last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
-                        checkpoint_spectral(spectral)  # baseline BEFORE fix
-                        applied_fix = True
-                        time.sleep(0.05)  # cooldown: let bridge stream 2-3 frames
                     else:
-                        print(f"     ⚠ no matching param in {dname}")
+                        print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
+
+                    last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
+                    checkpoint_spectral(spectral)  # baseline BEFORE fix
+                    applied_fix = True
+                    time.sleep(0.05)  # cooldown: let bridge stream 2-3 frames
                 else:
                     print(f"     ⚠ no matching device for {rec_text}")
             else:
@@ -723,8 +760,14 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                         if pinfo['index'] == pidx:
                             current_val = pinfo['value']
                             break
-                new_val = max(0.0, min(1.0, current_val - delta))
+                new_val = max(-1.0, min(1.0, current_val - delta))  # EQ8 gain is bipolar
                 bridge.set_param(ti, di, pidx, new_val)
+                # Update cache
+                if key in _param_cache:
+                    for _pn, pinfo in _param_cache[key].items():
+                        if pinfo['index'] == pidx:
+                            pinfo['value'] = new_val
+                            break
                 print(f"     ↩  reversed Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
                 applied_fix = False
         else:
