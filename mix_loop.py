@@ -818,6 +818,154 @@ def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
     ]
 
 
+# ─── Direct track targeting (preset commands) ───
+
+PRESETS = {
+    "aggressive": {
+        "description": "Add grit and intensity — boost drive, tighten attack",
+        "actions": [
+            {"devices": ["Saturator"], "params": ["drive"], "delta": +0.15, "ceiling": "Saturator/Drive"},
+            {"devices": ["Compressor", "Glue Compressor"], "params": ["threshold"], "delta": -0.08, "ceiling": None},
+            {"devices": ["Drum Buss"], "params": ["drive"], "delta": +0.10, "ceiling": "Drum Buss/Drive"},
+        ]
+    },
+    "wider": {
+        "description": "Increase stereo width and spatial presence",
+        "actions": [
+            {"devices": ["Utility"], "params": ["width", "stereo width"], "delta": +0.15, "ceiling": None},
+            {"devices": ["Reverb"], "params": ["dry/wet", "wet dry", "mix"], "delta": +0.08, "ceiling": None},
+        ]
+    },
+    "darker": {
+        "description": "Reduce highs — darker, warmer tone",
+        "actions": [
+            {"devices": ["Auto Filter"], "params": ["frequency"], "delta": -0.08, "ceiling": None},
+            {"devices": ["EQ Eight"], "params": ["gain", "high"], "delta": -0.06, "ceiling": "EQ Eight/Gain"},
+        ]
+    },
+    "brighter": {
+        "description": "Boost highs — more presence and air",
+        "actions": [
+            {"devices": ["Auto Filter"], "params": ["frequency"], "delta": +0.08, "ceiling": None},
+            {"devices": ["EQ Eight"], "params": ["gain", "high"], "delta": +0.06, "ceiling": "EQ Eight/Gain"},
+        ]
+    },
+    "punchier": {
+        "description": "Faster attack, more transient emphasis",
+        "actions": [
+            {"devices": ["Compressor", "Glue Compressor"], "params": ["attack"], "delta": -0.10, "ceiling": None},
+            {"devices": ["Compressor", "Glue Compressor"], "params": ["threshold"], "delta": -0.05, "ceiling": None},
+            {"devices": ["Drum Buss"], "params": ["boom"], "delta": +0.05, "ceiling": "Drum Buss/Boom"},
+        ]
+    },
+    "softer": {
+        "description": "Reduce grit — less drive, more dynamic",
+        "actions": [
+            {"devices": ["Saturator"], "params": ["drive"], "delta": -0.10, "ceiling": None},
+            {"devices": ["Compressor", "Glue Compressor"], "params": ["threshold"], "delta": +0.08, "ceiling": None},
+        ]
+    },
+    "bigger": {
+        "description": "More reverb, wider, slightly louder",
+        "actions": [
+            {"devices": ["Reverb"], "params": ["dry/wet", "wet dry", "mix"], "delta": +0.12, "ceiling": None},
+            {"devices": ["Reverb"], "params": ["decay", "decay time"], "delta": +0.08, "ceiling": None},
+            {"devices": ["Utility"], "params": ["width", "stereo width"], "delta": +0.08, "ceiling": None},
+            {"devices": ["Utility"], "params": ["gain"], "delta": +0.03, "ceiling": "Utility/Gain"},
+        ]
+    },
+    "tighter": {
+        "description": "Less reverb, shorter decay, more focused",
+        "actions": [
+            {"devices": ["Reverb"], "params": ["dry/wet", "wet dry", "mix"], "delta": -0.10, "ceiling": None},
+            {"devices": ["Reverb"], "params": ["decay", "decay time"], "delta": -0.08, "ceiling": None},
+            {"devices": ["Delay", "Echo"], "params": ["dry/wet", "wet dry", "mix"], "delta": -0.08, "ceiling": None},
+        ]
+    },
+    "warmer": {
+        "description": "Add saturation, reduce highs, emphasize mids",
+        "actions": [
+            {"devices": ["Saturator"], "params": ["drive"], "delta": +0.08, "ceiling": "Saturator/Drive"},
+            {"devices": ["EQ Eight"], "params": ["gain", "high"], "delta": -0.04, "ceiling": "EQ Eight/Gain"},
+        ]
+    },
+    "clean": {
+        "description": "Remove effects — zero saturation, dry reverb, flat EQ",
+        "actions": [
+            {"devices": ["Saturator"], "params": ["drive"], "delta": -0.30, "ceiling": None},
+            {"devices": ["Compressor", "Glue Compressor"], "params": ["threshold"], "delta": +0.15, "ceiling": None},
+            {"devices": ["Reverb"], "params": ["dry/wet", "wet dry", "mix"], "delta": -0.30, "ceiling": None},
+        ]
+    },
+}
+
+
+def find_preset(name):
+    """Find preset by name (case-insensitive, partial match). Returns (name, preset) or (None, None)."""
+    name_lower = name.lower().strip()
+    if name_lower in PRESETS:
+        return name_lower, PRESETS[name_lower]
+    for pname, preset in PRESETS.items():
+        if pname in name_lower or name_lower in pname:
+            return pname, preset
+    return None, None
+
+
+def apply_target(session_devices, track_identifier, preset_name):
+    """Apply a preset to matching track(s). Returns (changes_list, message)."""
+    pname, preset = find_preset(preset_name)
+    if not preset:
+        return [], f"Unknown preset '{preset_name}'. Available: {', '.join(sorted(PRESETS.keys()))}"
+
+    # Find matching tracks by index, name, or role
+    tid_lower = str(track_identifier).lower()
+    matches = []
+    for d in session_devices:
+        if d.get("track_muted"):
+            continue
+        if str(d["track_idx"]) == str(track_identifier):
+            matches.append(d)
+        elif tid_lower in d["track_name"].lower():
+            matches.append(d)
+
+    if not matches:
+        return [], f"No tracks found matching '{track_identifier}'"
+
+    results = []
+    for action in preset["actions"]:
+        for dm in matches:
+            dname = dm["device_name"].lower()
+            if any(adt.lower() in dname for adt in action["devices"]):
+                params = fetch_device_params(dm["track_idx"], dm["device_idx"])
+                for ph in action["params"]:
+                    for pname, pinfo in params.items():
+                        if ph.lower() in pname:
+                            new_val = max(0.0, min(1.0, pinfo["value"] + action["delta"]))
+                            ck = action.get("ceiling")
+                            if ck and action["delta"] > 0 and pinfo["value"] >= GAIN_CEILINGS.get(ck, 1.0):
+                                results.append(f"AT-CEIL: {dm['track_name']}/{dm['device_name']}/{pname}")
+                                continue
+                            r = lp_call("set_device_parameter", {
+                                "track_index": dm["track_idx"],
+                                "device_index": dm["device_idx"],
+                                "parameter_index": pinfo["index"],
+                                "value": new_val,
+                            }, timeout=5)
+                            status = "OK" if r.get("ok") else "FAIL"
+                            results.append(
+                                f"{status}: {dm['track_name']}/{dm['device_name']}/{pname}: "
+                                f"{pinfo['value']:.3f}→{new_val:.3f} (Δ{action['delta']:+.2f})"
+                            )
+                            break  # one param per action per device
+                break  # one device per action
+
+    if not results:
+        return [], f"Preset '{pname}' applied — no matching devices on '{track_identifier}'"
+
+    msg = f"Preset '{pname}': {preset['description']} → {len(results)} changes"
+    return results, msg
+
+
 # ─── Loop mode ───
 
 # NASA Rule 2: hard time budgets — every operation has bounded completion
@@ -1200,9 +1348,31 @@ def main():
         for line in results:
             print(line)
 
+    elif cmd == "target":
+        if len(sys.argv) < 3:
+            print("Usage: mix_loop.py target <track_id|name> <preset>")
+            print("Presets: " + ", ".join(sorted(PRESETS.keys())))
+            sys.exit(1)
+        track_id = sys.argv[2]
+        preset_name = sys.argv[3] if len(sys.argv) > 3 else "aggressive"
+        session = scan_session(fast=True)
+        if not session:
+            print("ERROR: Cannot reach LivePilot")
+            sys.exit(1)
+        auto_snapshot(session["devices"])
+        changes, msg = apply_target(session["devices"], track_id, preset_name)
+        print(msg)
+        for line in changes:
+            print(f"  {line}")
+
+    elif cmd == "presets":
+        for name in sorted(PRESETS.keys()):
+            p = PRESETS[name]
+            print(f"  {name:12s} — {p['description']}")
+
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|roles|snapshot|rollback|history|clear-history]")
+        print("Usage: mix_loop.py [capture|fix|loop|analyze|test|scan|roles|snapshot|rollback|target|presets|history|clear-history]")
         sys.exit(1)
 
 
