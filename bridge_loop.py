@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+Async bridge-based mixing loop — continuous spectral stream + pipelined analysis.
+
+Architecture:
+  Receiver thread:  binds UDP 9880, continuously reads spectral packets,
+                    updates a thread-safe latest_spectrum buffer.
+  Main thread:      grabs latest spectrum (non-blocking), analyzes, applies fixes.
+                    BlackHole validation spawned async — main loop doesn't pause.
+
+Latency per iteration: analysis time + UDP write (~5-20ms)
+  vs. old loop:  20× UDP read (~200ms) + analysis + write
+  vs. TCP loop:  TCP round-trip (~300ms) + scan + analysis + write (~15-30s)
+
+Bridge spectral stream runs at ~50Hz; we read the latest frame whenever we're ready.
+No blocking reads, no artificial delays.
+"""
+
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# ─── Config ───
+PYTHON = "/Users/warrenhayes/mlx-env/bin/python"
+ANALYZER = os.path.expanduser("~/.hermes/scripts/audio_analyzer.py")
+PROFILE = os.path.expanduser("~/.hermes/data/deepspace_reference_profile.json")
+MIXING = os.path.expanduser("~/.hermes/scripts")
+sys.path.insert(0, MIXING)
+
+from mixing import (
+    find_biggest_deviation, map_band_to_fix,
+    ROLE_TO_CATEGORY, parse_track_role, get_track_category, category_matches_recommendation,
+    GAIN_CEILINGS, GAIN_FLOORS, PROPORTIONAL_GAIN,
+)
+
+BRIDGE_RX = 9880
+BRIDGE_TX = 9881
+VALIDATION_INTERVAL = 10  # BlackHole ground truth every N iterations
+BANDS = ['sub', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'air']
+BAND_INDEX_MAP = {'sub': 0, 'bass': 1, 'low_mid': 2, 'mid': 3, 'high_mid': 4, 'presence': 5, 'air': 6}
+
+
+# ═══════════════════════════════════════════
+# SPECTRAL RECEIVER — background thread
+# ═══════════════════════════════════════════
+
+class SpectralReceiver(threading.Thread):
+    """Continuously reads spectral packets from UDP 9880 in a background thread.
+    Main thread calls get_latest() for the most recent frame (non-blocking).
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._lock = threading.Lock()
+        self._latest = None       # list of 7 floats
+        self._timestamp = 0.0
+        self._count = 0
+        self._running = False
+        self._sock = None
+
+    def run(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(('127.0.0.1', BRIDGE_RX))
+        self._sock.settimeout(0.5)
+        self._running = True
+
+        while self._running:
+            try:
+                data, _ = self._sock.recvfrom(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            # Parse OSC: find /spectral_shape
+            null = data.find(b'\x00')
+            if null < 0:
+                continue
+            addr = data[:null].decode('ascii', errors='replace')
+            if addr != '/spectral_shape':
+                continue
+
+            # Skip type tag string
+            pos = (null + 4) & ~3
+            tag_end = data.find(b'\x00', pos)
+            if tag_end < 0:
+                continue
+            pos = (tag_end + 4) & ~3
+
+            # Parse 7 float32 values
+            values = []
+            for _ in range(7):
+                if pos + 4 > len(data):
+                    break
+                values.append(struct.unpack('>f', data[pos:pos+4])[0])
+                pos += 4
+
+            if len(values) == 7:
+                with self._lock:
+                    self._latest = values
+                    self._timestamp = time.time()
+                    self._count += 1
+
+    def get_latest(self):
+        """Non-blocking. Returns (values, timestamp, count) or (None, 0, 0)."""
+        with self._lock:
+            return self._latest, self._timestamp, self._count
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════
+# BRIDGE COMMAND SENDER — fire and forget
+# ═══════════════════════════════════════════
+
+class BridgeSender:
+    """Sends UDP commands to the M4L bridge (port 9881). Fire-and-forget —
+    no response read needed; the spectral stream confirms results.
+    """
+
+    def __init__(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def set_param(self, track_idx, device_idx, param_idx, value):
+        """Send set_param OSC command. No response read — returns immediately."""
+        cmd = b'set_param\x00\x00\x00'
+        types = b',iiif\x00'
+        args = struct.pack('>iiif', track_idx, device_idx, param_idx, float(value))
+        self._sock.sendto(cmd + types + args, ('127.0.0.1', BRIDGE_TX))
+
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════
+# BLACKHOLE VALIDATION — async subprocess
+# ═══════════════════════════════════════════
+
+class AsyncValidation:
+    """Spawn ffmpeg capture + analysis in background. Main loop polls for result."""
+
+    def __init__(self):
+        self._process = None
+        self._wav_path = None
+
+    def start(self):
+        """Launch ffmpeg capture → analysis in background."""
+        fd, self._wav_path = tempfile.mkstemp(suffix='.wav')
+        os.close(fd)
+
+        # Capture 4s of audio via BlackHole
+        self._process = subprocess.Popen(
+            ['ffmpeg', '-y', '-f', 'avfoundation', '-i', ':2',
+             '-t', '4', '-ar', '22050', '-ac', '2', '-c:a', 'pcm_s16le',
+             self._wav_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._start_time = time.time()
+
+    def poll(self):
+        """Check if capture+analysis is done. Returns comparison dict or None."""
+        if self._process is None:
+            return None
+
+        # Check if ffmpeg finished
+        if self._process.poll() is None:
+            # Still running
+            return None
+
+        # ffmpeg done — run analysis
+        if self._process.returncode != 0:
+            self._cleanup()
+            return {"error": f"ffmpeg exited {self._process.returncode}"}
+
+        try:
+            r = subprocess.run(
+                [PYTHON, ANALYZER, 'compare', self._wav_path, PROFILE],
+                capture_output=True, text=True, timeout=60,
+            )
+            self._cleanup()
+            if r.returncode == 0:
+                return json.loads(r.stdout)
+            return {"error": f"analyzer exit {r.returncode}", "stderr": r.stderr[:500]}
+        except Exception as e:
+            self._cleanup()
+            return {"error": str(e)}
+
+    def _cleanup(self):
+        if self._wav_path and os.path.exists(self._wav_path):
+            try:
+                os.unlink(self._wav_path)
+            except Exception:
+                pass
+        self._process = None
+        self._wav_path = None
+
+    def elapsed(self):
+        if self._start_time:
+            return time.time() - self._start_time
+        return 0
+
+    @property
+    def running(self):
+        return self._process is not None and self._process.poll() is None
+
+
+# ═══════════════════════════════════════════
+# TCP FALLBACK — for track/device discovery
+# ═══════════════════════════════════════════
+
+import socket as sock_module
+
+def tcp_call(cmd, params=None, timeout=10):
+    s = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(('127.0.0.1', 9878))
+        s.sendall(json.dumps({'id':'x','type':cmd,'params':params or {}}).encode()+b'\n')
+        r = b''
+        while True:
+            try:
+                c = s.recv(65536)
+                if not c: break
+                r += c
+            except: break
+        for line in r.decode().strip().split('\n'):
+            if line.strip():
+                try: return json.loads(line)
+                except: pass
+        return {'ok': False}
+    finally:
+        s.close()
+
+_track_cache = {}
+_param_cache = {}
+
+def get_track_names():
+    r = tcp_call('get_all_track_names', timeout=10)
+    return r['result']['tracks'] if r.get('ok') else []
+
+def get_track_devices(ti):
+    if ti in _track_cache:
+        return _track_cache[ti]
+    r = tcp_call('get_track_info', {'track_index': ti}, timeout=4)
+    if not r.get('ok'): return []
+    devs = [{'index': di, 'name': d.get('name','')} for di, d in enumerate(r['result'].get('devices',[]))]
+    _track_cache[ti] = devs
+    return devs
+
+def get_device_params(ti, di):
+    r = tcp_call('get_device_parameters', {'track_index': ti, 'device_index': di}, timeout=6)
+    if not r.get('ok'): return {}
+    return {p['name'].lower(): {'index': p['index'], 'value': p['value']}
+            for p in r['result'].get('parameters', [])}
+
+def get_cached_param_index(ti, di, param_hints):
+    key = (ti, di)
+    if key not in _param_cache:
+        _param_cache[key] = get_device_params(ti, di)
+    # param_hints are substrings, not exact keys (e.g. "gain" matches "1 Gain A")
+    for hint in param_hints:
+        hint_lower = hint.lower()
+        for pname, pinfo in _param_cache[key].items():
+            if hint_lower in pname:
+                return pinfo['index']
+    return None
+
+
+# ═══════════════════════════════════════════
+# ANALYSIS — compute fix from spectral delta
+# ═══════════════════════════════════════════
+
+# Bridge raw values are 0-1 energy, reference profile is dB (30-45).
+# Bridge data is ONLY used for relative movement tracking between validations.
+# BlackHole validation provides the absolute ground truth comparison.
+
+_last_validation_deviation = None  # (band, direction, sigmas) from last BlackHole check
+_last_validation_spectral = None   # bridge spectral at time of validation
+
+
+def set_validation_ground_truth(comparison_result, current_spectral=None):
+    """Called after each BlackHole validation to set the ground truth target."""
+    global _last_validation_deviation, _last_validation_spectral
+    if not comparison_result or 'error' in comparison_result:
+        return
+    band_issues = comparison_result.get('band_issues', [])
+    _last_validation_deviation = find_biggest_deviation(band_issues)
+    if current_spectral and _last_validation_deviation:
+        _last_validation_spectral = list(current_spectral)
+
+
+def get_band_direction(current_spectral, band_name):
+    """Check if bridge band is moving up/down relative to last ground truth.
+    Returns 'improving', 'worsening', or 'stable'.
+    """
+    global _last_validation_spectral, _last_validation_deviation
+    if not _last_validation_deviation or not _last_validation_spectral:
+        return 'stable'
+
+    target_band, target_direction, _ = _last_validation_deviation
+    if band_name != target_band:
+        return 'stable'
+
+    band_idx = BAND_INDEX_MAP.get(band_name, 0)
+    delta = current_spectral[band_idx] - _last_validation_spectral[band_idx]
+
+    if target_direction == 'weak' and delta > 0.001:
+        return 'improving'
+    elif target_direction == 'hot' and delta < -0.001:
+        return 'improving'
+    elif abs(delta) < 0.001:
+        return 'stable'
+    else:
+        return 'worsening'
+
+
+def checkpoint_spectral(spectral):
+    """Store current spectral as the reference point. Called after applying a fix."""
+    global _last_validation_spectral
+    _last_validation_spectral = list(spectral)
+
+
+# ═══════════════════════════════════════════
+# MAIN ASYNC LOOP
+# ═══════════════════════════════════════════
+
+def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL):
+    global _last_validation_deviation, _last_validation_spectral
+
+    print("═" * 60)
+    print("Bridge Async Mixing Loop")
+    print(f"  Architecture:  receiver thread + analysis pipeline")
+    print(f"  Max iterations: {iterations}")
+    print(f"  Validate every: {validate_every}")
+    print("═" * 60)
+
+    # 1. Start spectral receiver thread
+    receiver = SpectralReceiver()
+    receiver.start()
+    time.sleep(0.3)  # let it start and get first packets
+    if not receiver.is_alive():
+        print("ERROR: Receiver thread didn't start. Is the bridge running?")
+        return
+
+    _, _, init_count = receiver.get_latest()
+    if init_count == 0:
+        print("ERROR: No spectral packets received. Is Ableton playing?")
+        receiver.stop()
+        return
+    print(f"\n✓ Receiver thread alive — {init_count} packets buffered\n")
+
+    # 2. Get track info via TCP (once)
+    track_names = get_track_names()
+    tagged = sum(1 for t in track_names if parse_track_role(t.get('name','')))
+    print(f"  {len(track_names)} tracks, {tagged} tagged\n")
+
+    # 4. Bridge sender
+    bridge = BridgeSender()
+
+    # 5. State
+    prev_spectral = None
+    prev_count = init_count
+    validation = None
+    last_fix_info = None  # (track_idx, device_idx, param_idx, delta, band, direction)
+    applied_fix = False   # whether we just applied a fix
+
+    print("Starting main loop...\n")
+
+    for i in range(iterations):
+        t0 = time.time()
+
+        # Check for completed validation
+        if validation is not None:
+            result = validation.poll()
+            if result is not None:
+                if 'error' not in result:
+                    band_issues = result.get('band_issues', [])
+                    biggest = find_biggest_deviation(band_issues)
+                    if biggest:
+                        band, direction, sigmas = biggest
+                        print(f"  📊 VALIDATION #{i+1}: {band} {direction} ({sigmas:.1f}σ) — {validation.elapsed():.1f}s")
+                        set_validation_ground_truth(result, spectral)
+                        # Force first fix on next iteration
+                        applied_fix = False
+                    else:
+                        print(f"  📊 VALIDATION #{i+1}: all bands within deadband ✓ — {validation.elapsed():.1f}s")
+                        _last_validation_deviation = None
+                else:
+                    print(f"  📊 VALIDATION #{i+1}: FAILED — {result['error']}")
+                validation = None
+
+        # ── Get latest spectrum ──
+        spectral, ts, count = receiver.get_latest()
+
+        if spectral is None:
+            time.sleep(0.005)
+            continue
+
+        # ── If no ground truth yet, skip analysis ──
+        if _last_validation_deviation is None:
+            # Validation takes ~5s — slow poll until it finishes
+            if validation and validation.running:
+                print(f"[{i+1:3d}] ⏳ waiting for first validation ({validation.elapsed():.1f}s elapsed)")
+                time.sleep(0.5)
+            else:
+                print(f"[{i+1:3d}] ⏳ waiting for first validation  ({time.time()-t0:.3f}s)")
+                # Spawn first validation if not already running
+                if validation is None:
+                    validation = AsyncValidation()
+                    validation.start()
+                    print(f"  ⏳ BlackHole validation started...")
+                time.sleep(0.5)
+            prev_spectral = spectral
+            continue
+
+        target_band, target_direction, target_sigmas = _last_validation_deviation
+
+        # ── Check direction of movement ──
+        movement = get_band_direction(spectral, target_band)
+
+        if movement == 'improving':
+            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} IMPROVING  ({time.time()-t0:.3f}s)")
+            # Update checkpoint — this is the new baseline
+            checkpoint_spectral(spectral)
+        elif not applied_fix or movement == 'stable':
+            # First fix after validation, or stable → apply next adjustment
+            label = "applying fix" if not applied_fix else "stable — applying next fix"
+            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} {label}  ({time.time()-t0:.3f}s)")
+            # Apply the fix
+            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i)
+            if fix:
+                candidates = [t for t in track_names
+                            if not t.get('mute')
+                            and get_track_category(t['name'])
+                            and category_matches_recommendation(get_track_category(t['name']), rec_text)]
+                if not candidates:
+                    candidates = [t for t in track_names if not t.get('mute')]
+
+                match = None
+                for cand in candidates[:5]:
+                    devs = get_track_devices(cand['index'])
+                    for dev in devs:
+                        if any(dt.lower() in dev['name'].lower() for dt in fix['devices']):
+                            match = (cand['index'], dev['index'], dev['name'], cand['name'])
+                            break
+                    if match: break
+
+                if match:
+                    ti, di, dname, tname = match
+                    pidx = get_cached_param_index(ti, di, fix['params'])
+                    if pidx is not None:
+                        delta = fix['delta_base'] * PROPORTIONAL_GAIN
+                        bridge.set_param(ti, di, pidx, 0.5 + delta)
+                        print(f"     ✏️  {dname}({tname}) Δ{delta:+.2f}")
+                        last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
+                        checkpoint_spectral(spectral)  # baseline BEFORE fix
+                        applied_fix = True
+                        time.sleep(0.05)  # cooldown: let bridge stream 2-3 frames
+                    else:
+                        print(f"     ⚠ no matching param in {dname}")
+                else:
+                    print(f"     ⚠ no matching device for {rec_text}")
+            else:
+                print(f"     ⚠ no fix mapping for {target_band}/{target_direction}")
+        elif movement == 'worsening':
+            print(f"[{i+1:3d}] ⚠️  {target_band:10s} {target_direction:4s} WORSE — reversing  ({time.time()-t0:.3f}s)")
+            # Reverse last fix
+            if last_fix_info:
+                ti, di, pidx, delta, _, _ = last_fix_info
+                bridge.set_param(ti, di, pidx, 0.5 - delta)
+                print(f"     ↩  reversed Δ{delta:+.2f}")
+                applied_fix = False
+        else:
+            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} monitoring  ({time.time()-t0:.3f}s)")
+
+        prev_spectral = spectral
+        time.sleep(0.005)  # prevent CPU spin; bridge streams at ~50Hz
+
+        # ── Spawn validation if due ──
+        if (i + 1) % validate_every == 0 and validation is None:
+            validation = AsyncValidation()
+            validation.start()
+            print(f"  ⏳ BlackHole validation started (will resolve in ~5s)...")
+            applied_fix = False  # reset — ground truth about to refresh
+
+    # ── Cleanup ──
+    print(f"\n{'═'*60}")
+    if validation and validation.running:
+        print("Waiting for final validation...")
+        while validation.running:
+            time.sleep(0.5)
+        result = validation.poll()
+        if result and 'error' not in result:
+            print(f"Final: {len(result.get('band_issues',[]))} issues")
+    print("Loop complete")
+    print(f"{'═'*60}")
+
+    receiver.stop()
+    bridge.close()
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Async bridge-based mixing loop')
+    parser.add_argument('-n', '--iterations', type=int, default=50,
+                        help='Max iterations (default: 50)')
+    parser.add_argument('-v', '--validate-every', type=int, default=VALIDATION_INTERVAL,
+                        help=f'Validation interval (default: {VALIDATION_INTERVAL})')
+    args = parser.parse_args()
+    run_async_loop(iterations=args.iterations, validate_every=args.validate_every)
