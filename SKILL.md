@@ -1,139 +1,127 @@
 ---
 name: hermes-ableton-mixing-loop
-description: "Closed-loop mixing: BlackHole capture, spectral analysis, reference comparison, LivePilot parameter adjustment. Also direct track targeting with presets."
-version: 3.0.0
+description: "Closed-loop mixing: BlackHole capture, spectral analysis, reference comparison, LivePilot parameter adjustment. Async bridge loop with sigma-scaled deltas, candidate scoring, and stuck detection."
+version: 3.1.0
 ---
 
 # Hermes ↔ Ableton Closed-Loop Mixing
 
-Trigger: user wants to mix a track in Ableton with objective audio analysis feedback, or apply presets to specific tracks.
+Trigger: user wants to mix a track in Ableton with objective audio analysis feedback.
 
 ## Two Loop Drivers
 
-### bridge_loop.py — async high-speed (UDP + TCP)
-Location: `~/.hermes/scripts/bridge_loop.py`
+### bridge_loop.py — async high-speed (recommended)
 
 Architecture:
 ```
-M4L bridge (UDP 9880 spectral stream) → Receiver thread (non-blocking buffer)
+M4L bridge (UDP 9880 spectral stream) → Receiver thread (non-blocking)
     → Main loop: analyze → map fix → UDP set_param (2ms)
     → BlackHole validation (async subprocess, every N iterations)
-    → Bridge spectral tracks direction between validations
 ```
 
-Per-iteration latency: ~5ms (vs 15-30s for mix_loop.py TCP).
+Two operating modes:
+- **Aggressive** (>20σ): Sigma-scaled deltas, skip bridge verification, apply-and-trust
+- **Normal** (≤20σ): Bridge direction tracking, smaller deltas, surgical adjustments
 
-Key features:
-- `--list-refs` — numbered list of 31 reference tracks
-- `--refs 3,5,12` — targeted profile from specific tracks (cached, instant)
-- Category-based track routing (air→hats, bass→KICK, etc.)
-- Band-to-EQ-filter mapping (bass→filter 2, air→filter 8)
-- Q/resonance mapped to spectral gap width (sigmas→Q)
-- ensure_device() adds EQ Eight via LivePilot if missing
-- Per-track analysis cache at `~/.hermes/data/deepspace_per_track/`
+```bash
+bridge_loop.py --list-refs              # Numbered list of 30 reference tracks
+bridge_loop.py --refs 12,20,24 -n 30    # Run against specific tracks
+```
 
 ### mix_loop.py — synchronous TCP (legacy)
-Location: repo root
 
-14 CLI commands: capture, fix, loop, target, presets, roles, scan, snapshot, rollback, analyze, history, clear-history.
+14 CLI commands: capture, fix, loop, target, presets, etc.
 
 ## Prerequisites
 
-- BlackHole 2ch installed (virtual audio driver)
-- Ableton output routed to BlackHole 2ch in Preferences → Audio
-- LivePilot Remote Script running (port 9878)
-- LivePilot Analyzer M4L device on master track (for bridge loop — port 9880/9881)
-- Python deps: /Users/warrenhayes/mlx-env/bin/python (librosa, numpy, scipy, soundfile, pyloudnorm)
-- Reference tracks at ~/Desktop/Deepspace reference tracks/ (31 deep techno tracks)
-- Profile cache at ~/.hermes/data/deepspace_per_track/ (30/31 pre-analyzed)
+- BlackHole 2ch, Ableton output routed to it
+- LivePilot Remote Script (port 9878)
+- LivePilot Analyzer M4L device on master track (UDP 9880/9881)
+- Python: /Users/warrenhayes/mlx-env/bin/python
 
-## Track Role Tagging
+## Six Tool Improvements (v3.1)
 
-**Convention: first word of track name = role tag.** Case-insensitive. Plurals handled. Trailing punctuation stripped.
+### 1. Sigma-Scaled Deltas
+```python
+scale_delta_for_sigmas(delta_base, sigmas)
+# 2σ → 1x, 8σ → 2x, 20σ+ → 5x
+```
+Big gaps get aggressive moves. Small gaps stay surgical.
 
-120+ valid tags across 7 categories. See mixing.py → ROLE_TO_CATEGORY.
+### 2. Aggressive Mode (Skip Bridge Verification)
+Above 20σ, bridge direction tracking is noise — skip IMPROVING/WORSE/reverse dance. Apply fixes and verify on next BlackHole validation.
 
-## Category Routing (v3)
+### 3. Candidate Scoring by Tag Match
+Tracks scored by role tag relevance to band name:
+- Role matches band ("bass" → "bass BASS-FM"): 5 points
+- Same category (low_end → KICK): 2 points
+- Untagged: 0 points
 
-The loop routes fixes to the right track by spectral band → category:
+Bass fixes now prefer bass BASS-FM over KICK. Air fixes route to hats, not KICK.
+
+### 4. Stuck Detection + Escalation
+- Detects ceiling/floor hits (no room to move)
+- Counts consecutive stuck iterations
+- Labels [STUCK x5] in output
+- After 5 stuck iterations, cycles to next candidate track or fix
+
+### 5. Validation Comparison
+Compares consecutive BlackHole validations:
+- `✓ improved: bass 46σ → 31σ`
+- `✗ worse: bass 31σ → 46σ`
+
+Ground truth replaces noisy bridge direction tracking.
+
+### 6. Validation Spawn Fix
+Moved to top of each iteration so aggressive mode doesn't skip periodic BlackHole checks.
+
+## Reference Tracks
+
+30 tracks at `~/Desktop/Deepspace reference tracks/`:
+- Alarico, Benza, Chlar, No Valentia, Vilchezz, and others
+- Profile cache at `~/.hermes/data/deepspace_per_track/` (instant load)
+
+## Category Routing
 
 | Spectral band | Category | Example tracks |
 |---|---|---|
-| sub, bass | low_end | KICK, BASS, SUB, RUMBLE |
-| presence, air | hi_freq | HATS, RIDE, CYMBAL, SHIMMER |
-| low_mid, mid | synth, mid | PAD, LEAD, CHORD, VOX |
-| — | percussion | PERC, SNARE, CLAP, TOMS |
-| — | spatial | FX, REVERB, DELAY, NOISE |
+| sub, bass | low_end | bass BASS-FM, KICK, HARDGROOVE |
+| presence, air | hi_freq | hats 909-HARDCORE |
+| low_mid, mid | synth, mid | PAD, LEAD, CHORD |
 
-If no categorized track found, falls back to all unmuted tracks.
+## Band-to-EQ-Filter & Q Mapping
 
-## Band-to-EQ-Filter Mapping
-
-| Spectral band | EQ Eight filter | Frequency range |
-|---|---|---|
-| sub | 1 | 20-60Hz |
-| bass | 2 | 60-120Hz |
-| low_mid | 3 | 120-250Hz |
-| mid | 5 | 250-2000Hz |
-| high_mid | 6 | 2000-6000Hz |
-| presence | 7 | 6000-12000Hz |
-| air | 8 | 12000Hz+ |
-
-## Q/Resonance Mapping
-
-Wider spectral gap → wider Q (lower resonance) to cover more frequencies:
-
-| Sigmas | Q | Effect |
-|---|---|---|
-| >8σ | 0.15 | Very wide — whole region needs fixing |
-| 4-8σ | 0.30 | Wide |
-| 2-4σ | 0.50 | Medium |
-| 1-2σ | 0.70 | Surgical — narrow |
-| <1σ | (none) | Deadband — no adjustment |
-
-## Reference Track Selection
-
-```
-bridge_loop.py --list-refs              # Numbered list of all 31 tracks
-bridge_loop.py --refs 12,19,24 -n 30    # Run against 3 specific tracks
-bridge_loop.py -n 30                    # Run against all 31 (default)
-```
-
-Profile built instantly from per-track cache. 30/31 tracks pre-analyzed.
-
-## Architecture (refactored June 2026)
-
-```
-mixing.py          (450 lines) — pure logic, zero transport, shared library
-bridge_loop.py     (850 lines) — async UDP receiver thread + TCP fallback
-mix_loop.py        (380 lines) — raw TCP transport, standalone CLI
-audio_analyzer.py  (520 lines) — analysis engine, unchanged
-orchestrator.py    (310 lines) — Hermes MCP transport
-```
+| Band | EQ filter | >8σ Q | 4-8σ Q | 2-4σ Q | 1-2σ Q |
+|---|---|---|---|---|---|
+| sub | 1 | 0.15 | 0.30 | 0.50 | 0.70 |
+| bass | 2 | 0.15 | 0.30 | 0.50 | 0.70 |
+| low_mid | 3 | 0.15 | 0.30 | 0.50 | 0.70 |
+| mid | 5 | 0.15 | 0.30 | 0.50 | 0.70 |
+| high_mid | 6 | 0.15 | 0.30 | 0.50 | 0.70 |
+| presence | 7 | 0.15 | 0.30 | 0.50 | 0.70 |
+| air | 8 | 0.15 | 0.30 | 0.50 | 0.70 |
 
 ## Safety Features
 
-- **Role-based targeting**: Recommendations hit the right track by role tag
-- **Gain ceiling**: Parameters have hard maximums (GAIN_CEILINGS)
-- **Deadband**: No adjustment within 0.8 sigma
-- **Proportional control**: Deltas shrink each iteration (PROPORTIONAL_GAIN)
-- **EQ8 bipolar clamp**: Gain values clamped [-1, 1] (EQ Eight is bipolar)
-- **Param cache**: Device params cached across iterations, updated after writes
-- **Snapshot/rollback**: mix_loop.py supports auto-snapshot and rollback
-- **ensure_device**: Adds EQ Eight/Utility via LivePilot insert_device if missing
+- EQ8 bipolar clamp [-1, +1]
+- Ceiling/floor detection with stuck escalation
+- Param cache updated after every write
+- ensure_device() adds devices via LivePilot if missing
+- Deadband: no adjustment within 0.8σ
 
-## Parameter Pitfalls
+## Architecture
 
-- **EQ Eight gain is bipolar** [-1, +1], NOT unipolar [0, 1]. Clamping to 0 floors negative values.
-- **Glue Compressor Attack/Ratio/Release** are ENUM steps (0-6, 0-2, 0-6). Intermediate values silently fail.
-- **Utility Gain** range is [-1, 1], maps to -∞ to +35dB
-- Always verify with get_device_parameters after setting
-- Returned `ok: true` does NOT guarantee the value changed
+```
+mixing.py          (470 lines) — shared logic, sigma scaling, category routing
+bridge_loop.py     (960 lines) — async UDP receiver + aggressive/normal modes
+mix_loop.py        (380 lines) — legacy TCP transport
+audio_analyzer.py  (520 lines) — analysis engine
+orchestrator.py    (310 lines) — Hermes MCP transport
+```
 
 ## Known Limitations
 
-- Bridge spectral at 50Hz is too noisy to detect <0.05 gain changes reliably
-- Oscillation between IMPROVING/WORSE on small deltas
-- Reference profile is static — no live reference capture yet
-- No subjective override channel ("hats too dull") yet
-- LivePilot TCP calls take ~3s — initial device discovery is slow
+- Bridge at 50Hz can't detect <0.05 changes — aggressive mode handles this
+- Stuck escalation needs per-fix-index support in map_band_to_fix (coming)
+- Reference profile is static — no live capture
+- No subjective override channel yet
