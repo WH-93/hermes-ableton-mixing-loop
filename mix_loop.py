@@ -201,7 +201,107 @@ def scan_session(fast=True, force=False):
 
 
 # ═══════════════════════════════════════════
-# APPLY FUNCTIONS (raw TCP)
+# LEAN APPLY — no bulk scan, targeted RPM calls only
+# ═══════════════════════════════════════════
+
+def get_track_names():
+    """Get all track names and mute states. Uses get_all_track_names if available."""
+    batch = lp_call("get_all_track_names", timeout=10)
+    if batch.get("ok"):
+        return batch["result"].get("tracks", [])
+    # Fallback
+    r = lp_call("get_session_info", timeout=3)
+    if not r.get("ok"): return []
+    tracks = []
+    for ti in range(r["result"]["track_count"]):
+        t = lp_call("get_track_info", {"track_index": ti}, timeout=3)
+        if t.get("ok"):
+            tracks.append({"index": ti, "name": t["result"].get("name","?"), "mute": t["result"].get("mute",False)})
+    return tracks
+
+
+def resolve_and_apply(band_issues, track_names, iteration=0, peak_db=None):
+    """One-iteration lean loop: find biggest deviation, resolve target with targeted
+    LivePilot calls, apply ONE fix. No bulk scan."""
+    biggest = find_biggest_deviation(band_issues)
+    if not biggest:
+        return [f"Iter[{iteration}]: All bands within deadband — nothing to fix"]
+
+    band, direction, sigmas = biggest
+    fix, rec_text, _ = map_band_to_fix(band, direction, iteration)
+    if not fix:
+        return [f"Iter[{iteration}]: No fix mapping for '{band}/{direction}'"]
+
+    prop_factor = PROPORTIONAL_GAIN / (1 + iteration * 0.3)
+    redline_active = peak_db is not None and peak_db > REDLINE_PEAK_DB
+
+    # 1. Find candidate tracks by role tag (offline, from cached names)
+    candidates = []
+    for t in track_names:
+        if t.get("mute"): continue
+        cat = get_track_category(t["name"])
+        if cat and category_matches_recommendation(cat, rec_text):
+            candidates.append(t)
+    if not candidates:
+        # Untagged fallback: any track
+        candidates = [t for t in track_names if not t.get("mute")]
+
+    # 2. Query device info on candidates until we find a matching device
+    match = None
+    for cand in candidates[:5]:  # check first 5 candidates max
+        ti = cand["index"]
+        t = lp_call("get_track_info", {"track_index": ti}, timeout=4)
+        if not t.get("ok"): continue
+        for di, dev in enumerate(t["result"].get("devices", [])):
+            if any(dt.lower() in dev.get("name","").lower() for dt in fix["devices"]):
+                match = (ti, di, dev["name"], cand["name"])
+                break
+        if match: break
+
+    if not match:
+        return [f"Iter[{iteration}]: No device for '{rec_text}'"]
+
+    ti, di, dname, tname = match
+
+    # 3. Read current param value (ONE targeted call)
+    params = fetch_device_params(ti, di)
+    p_match = find_param_in_device(params, fix["params"])
+    if not p_match:
+        return [f"Iter[{iteration}]: No matching param on {dname}({tname})"]
+
+    pname, pidx, current = p_match
+    delta = fix["delta_base"] * prop_factor * min(1.0, sigmas / 3.0)
+
+    if delta > 0 and redline_active:
+        return [f"Iter[{iteration}]: BLOCKED — redline ({peak_db:.1f} dBFS)"]
+
+    new_val = current + delta
+    ck = fix.get("ceiling")
+    if ck and delta > 0 and current >= GAIN_CEILINGS.get(ck, 1.0):
+        return [f"Iter[{iteration}]: AT-CEIL[{ti}] {dname}({tname}) {pname}: {current:.3f}"]
+    if ck and delta < 0:
+        new_val = max(new_val, GAIN_FLOORS.get(ck, 0.0))
+    if abs(delta) < 0.005:
+        return [f"Iter[{iteration}]: Deadband — delta too small"]
+
+    new_val = max(0.0, min(1.0, new_val))
+
+    # 4. Apply (ONE write)
+    r = lp_call("set_device_parameter", {"track_index": ti, "device_index": di, "parameter_index": pidx, "value": new_val})
+    status = "OK" if r.get("ok") else "FAIL"
+
+    if status == "OK":
+        actual = r.get("result", {}).get("value")
+        if actual is not None and abs(actual - new_val) > 0.01:
+            status = "REJECTED"
+            new_val = actual
+
+    ratio_info = f" [{band} {direction}]" if "/" in band else ""
+    return [f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → {dname}({tname}) {pname}: {current:.3f}→{new_val:.3f} (Δ{delta:+.3f}){ratio_info} [{status}]"]
+
+
+# ═══════════════════════════════════════════
+# APPLY FUNCTIONS (raw TCP) — legacy, kept for scan-based commands
 # ═══════════════════════════════════════════
 
 def apply_greedy_tcp(session_devices, band_issues, iteration=0, peak_db=None):
@@ -371,13 +471,14 @@ def run_loop(iterations=5, duration=4):
     prev_recs = set()
     streak = 0
 
-    print(f"Scanning session once (frozen for entire loop)...", file=sys.stderr)
-    session = scan_session(fast=True)
-    if not session:
+    # Lean: get track names once (1s), no bulk device scan
+    print(f"Reading track names...", file=sys.stderr)
+    track_names = get_track_names()
+    if not track_names:
         print("ERROR: Cannot reach LivePilot", file=sys.stderr)
         return json.dumps({"error": "LivePilot not available"})
-    session_devices = session["devices"]
-    auto_snapshot(session_devices)
+    tagged = sum(1 for t in track_names if parse_track_role(t.get("name","")))
+    print(f"  {len(track_names)} tracks, {tagged} tagged\n", file=sys.stderr)
 
     for i in range(iterations):
         if time.time() - loop_start > LOOP_TIME_BUDGET:
@@ -432,8 +533,8 @@ def run_loop(iterations=5, duration=4):
                 streak = 0
             prev_recs = rec_set
 
-            print(f"  Greedy single-shot...", file=sys.stderr)
-            applied = apply_greedy_tcp(session_devices, band_issues, i, peak)
+            # Lean: resolve target and apply with targeted calls
+            applied = resolve_and_apply(band_issues, track_names, i, peak)
             report["applied"] = applied
             for line in applied:
                 print(f"    {line}", file=sys.stderr)
@@ -495,11 +596,9 @@ def main():
             print(f"  • {r}", file=sys.stderr)
 
         if recs:
-            session = scan_session(fast=True)
-            if session:
-                auto_snapshot(session["devices"])
-                results = apply_greedy_tcp(session["devices"], band_issues, 0, peak)
-                print(json.dumps({"recommendations": recs, "applied": results, "analysis": analysis}, indent=2))
+            track_names = get_track_names()
+            results = resolve_and_apply(band_issues, track_names, 0, peak)
+            print(json.dumps({"recommendations": recs, "applied": results, "analysis": analysis}, indent=2))
 
         os.unlink(audio_path)
 
