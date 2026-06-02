@@ -285,8 +285,9 @@ def scale_delta_for_sigmas(delta_base, sigmas):
     return delta_base * scale
 
 
-def map_band_to_fix(band, direction, iteration=0):
+def map_band_to_fix(band, direction, iteration=0, fix_idx=0):
     """Map a band+direction to a SMART_RECOMMENDATIONS fix action.
+    fix_idx: which fix to return (0=first, 1=second for escalation).
     Returns (fix_dict, rec_text, lower_band) or (None, None, None)."""
     prop_factor = PROPORTIONAL_GAIN / (1 + iteration * 0.3)
 
@@ -312,7 +313,8 @@ def map_band_to_fix(band, direction, iteration=0):
 
     for smart in SMART_RECOMMENDATIONS:
         if any(m.lower() in rec_text.lower() for m in smart["match"]):
-            return smart["fix"][0], rec_text, lower_band
+            fixes = smart["fix"]
+            return fixes[fix_idx % len(fixes)], rec_text, lower_band
 
     return None, None, None
 

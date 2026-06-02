@@ -700,7 +700,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
 
             # If stuck, try second fix action or different track
             fix_idx = 1 if _stuck_counter >= MAX_STUCK_ITERATIONS else 0
-            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i)
+            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i, fix_idx=fix_idx)
             if fix:
                 # If stuck, try next candidate track
                 stuck_offset = _stuck_counter // MAX_STUCK_ITERATIONS
@@ -750,7 +750,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                         delta = scale_delta_for_sigmas(fix['delta_base'], target_sigmas)
                         new_val = max(-1.0, min(1.0, current_val + delta))
 
-                        # Detect ceiling/floor hit — no room to move
+                        # Detect ceiling/floor hit
                         if abs(new_val - current_val) < 0.001:
                             print(f"     ⚠ {dname}({tname}) {pname} at limit ({current_val:.2f}) — stuck")
                             _stuck_counter += 1
@@ -768,6 +768,20 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
                                     bridge.set_param(ti, di, ridx, q_val)
                             print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val or '-'}")
                             _stuck_counter = 0
+                    else:
+                        print(f"     ⚠ no param '{fix['params']}' in {dname}({tname})")
+                        _stuck_counter += 1
+                else:
+                    print(f"     ⚠ no {fix['devices']} on {cand['name']}")
+                    # Try adding the device via LivePilot
+                    for dev_name in fix['devices']:
+                        di = ensure_device(cand['index'], dev_name)
+                        if di >= 0:
+                            # Device added — retry match
+                            match = (cand['index'], di, dev_name, cand['name'])
+                            break
+                    if not match:
+                        _stuck_counter += 1
             time.sleep(0.2)  # cooldown for aggressive mode
             prev_spectral = spectral
             continue
@@ -785,7 +799,7 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
             label = "applying fix" if not applied_fix else "stable — applying next fix"
             print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} {label}  ({time.time()-t0:.3f}s)")
             # Apply the fix
-            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i)
+            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i, fix_idx=fix_idx)
             if fix:
                 # Score candidates: prefer tracks whose role tag matches the band name
                 # "bass" fixes should prefer "bass BASS-FM" over "KICK"
