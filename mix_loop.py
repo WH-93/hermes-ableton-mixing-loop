@@ -725,14 +725,31 @@ def apply_greedy(session_devices, band_issues, iteration=0, peak_db=None):
     })
 
     status = "OK" if r.get("ok") else "FAIL"
+
+    # NASA Rule 7: verify the value actually changed
+    # LivePilot can return ok:true for enum-step params that silently reject
+    if status == "OK":
+        verify_params = fetch_device_params(ti, di)
+        v_match = find_param_in_device(verify_params, [pname])
+        if v_match:
+            _, _, actual_val = v_match
+            if abs(actual_val - new_val) > 0.01:
+                status = "REJECTED"
+                new_val = actual_val  # report what it actually is
+
     return [
         f"Iter[{iteration}]: {band} {direction} ({sigmas:.1f}σ) → "
         f"{dname}({tname}) {pname}: {current:.3f}→{new_val:.3f} "
-        f"(Δ{delta:+.3f})",
+        f"(Δ{delta:+.3f}) [{status}]",
     ]
 
 
 # ─── Loop mode ───
+
+# NASA Rule 2: hard time budgets — every operation has bounded completion
+LOOP_TIME_BUDGET = 120   # total seconds for entire loop
+ITER_TIME_BUDGET = 20    # per-iteration max (capture + analyze + apply)
+
 
 def load_history():
     if os.path.exists(HISTORY):
@@ -748,21 +765,48 @@ def save_history(history):
 
 
 def run_loop(iterations=5, duration=4):
-    """Run capture→analyze→apply loop with convergence tracking."""
+    """Run capture→analyze→apply loop with convergence tracking.
+    NASA Rule 2: hard time budgets prevent unbounded execution.
+    NASA Rule 3: scan frozen at loop start — no re-scanning mid-loop."""
     history = load_history()
     if not history.get("started"):
         history["started"] = datetime.now().isoformat()
     run_id = len(history["iterations"])
 
+    loop_start = time.time()
     results = []
     prev_recs = set()
     streak = 0
 
+    # Frozen scan — do it once, reuse across all iterations
+    print(f"Scanning session once (frozen for entire loop)...", file=sys.stderr)
+    session = scan_session(fast=True)
+    if not session:
+        print("ERROR: Cannot reach LivePilot", file=sys.stderr)
+        return json.dumps({"error": "LivePilot not available"})
+    session_devices = session["devices"]
+    print(f"  {len(session_devices)} devices frozen across {session['track_count']} tracks\n",
+          file=sys.stderr)
+
     for i in range(iterations):
+        # NASA Rule 2: total time budget
+        if time.time() - loop_start > LOOP_TIME_BUDGET:
+            print(f"\n  ⏰ Loop time budget ({LOOP_TIME_BUDGET}s) exceeded. Stopping gracefully.",
+                  file=sys.stderr)
+            results.append({"iteration": i, "stopped": "time_budget", "time": datetime.now().isoformat()})
+            break
+
         iter_start = time.time()
         report = {"iteration": i, "time": datetime.now().isoformat()}
 
         print(f"\n═══ Iteration {i+1}/{iterations} ═══", file=sys.stderr)
+
+        # NASA Rule 2: per-iteration time budget
+        # Don't start a capture if we're already close to the iter budget
+        if time.time() - loop_start > LOOP_TIME_BUDGET - ITER_TIME_BUDGET:
+            print(f"  ⏰ Not enough time remaining for another iteration. Stopping.",
+                  file=sys.stderr)
+            break
 
         # 1. Capture
         print(f"  Capturing {duration}s from BlackHole...", file=sys.stderr)
@@ -780,6 +824,7 @@ def run_loop(iterations=5, duration=4):
         analysis = comparison.get("analysis", {})
         recs = comparison.get("recommendations", [])
         peak = analysis.get("peak_db")
+        band_issues = comparison.get("band_issues", [])
 
         report["peak_db"] = peak
         report["lufs"] = analysis.get("lufs_integrated")
@@ -817,23 +862,9 @@ def run_loop(iterations=5, duration=4):
                 streak = 0
             prev_recs = rec_set
 
-            # 3. Scan session and apply
-            print(f"  Scanning session (fast)...", file=sys.stderr)
-            session = scan_session(fast=True)
-            if not session:
-                print(f"  ✗ Cannot reach LivePilot", file=sys.stderr)
-                report["error"] = "LivePilot not available"
-                results.append(report)
-                os.unlink(audio_path)
-                break
-
-            # Get band issues from comparison for greedy targeting
-            band_issues = comparison.get("band_issues", [])
-            
-            print(f"  Found {len(session['devices'])} devices across {session['track_count']} tracks", file=sys.stderr)
-
+            # 3. Apply (using frozen scan — no re-scanning)
             print(f"  Greedy single-shot...", file=sys.stderr)
-            applied = apply_greedy(session["devices"], band_issues, i, peak)
+            applied = apply_greedy(session_devices, band_issues, i, peak)
             report["applied"] = applied
             for line in applied:
                 print(f"    {line}", file=sys.stderr)
@@ -841,14 +872,25 @@ def run_loop(iterations=5, duration=4):
         report["total_time"] = round(time.time() - iter_start, 1)
         results.append(report)
         os.unlink(audio_path)
-        print(f"  ⏱ {report['total_time']}s", file=sys.stderr)
+
+        # NASA Rule 2: per-iteration budget check
+        iter_elapsed = time.time() - iter_start
+        print(f"  ⏱ {iter_elapsed:.1f}s", file=sys.stderr)
+        if iter_elapsed > ITER_TIME_BUDGET:
+            print(f"  ⚠ Iteration exceeded budget ({ITER_TIME_BUDGET}s). Continuing.",
+                  file=sys.stderr)
 
     # Save history
-    history["iterations"].append({"run_id": run_id, "results": results})
+    history["iterations"].append({
+        "run_id": run_id,
+        "total_time": round(time.time() - loop_start, 1),
+        "results": results,
+    })
     save_history(history)
 
     # Final report
-    print(f"\n───── LOOP COMPLETE ─────", file=sys.stderr)
+    loop_elapsed = time.time() - loop_start
+    print(f"\n───── LOOP COMPLETE ({loop_elapsed:.0f}s) ─────", file=sys.stderr)
     print(f"  Iterations: {len(results)}", file=sys.stderr)
     if len(results) >= 2:
         first = results[0]
