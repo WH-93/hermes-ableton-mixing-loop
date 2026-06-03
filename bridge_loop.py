@@ -29,6 +29,8 @@ import tempfile
 import threading
 import time
 
+from ws_bridge import WSSpectralBridge, WS_PORT
+
 # ─── Config ───
 PYTHON = "/Users/warrenhayes/mlx-env/bin/python"
 ANALYZER = os.path.expanduser("~/.hermes/scripts/audio_analyzer.py")
@@ -344,15 +346,21 @@ def emit(obj):
     sys.stdout.flush()
 
 
-def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
+def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None, ws_port=WS_PORT):
     profile_path = profile_path or PROFILE
 
     print("═" * 60, file=sys.stderr)
     print("Bridge Analysis Engine — agent-driven control mode", file=sys.stderr)
     print(f"  Max iterations: {iterations}", file=sys.stderr)
     print(f"  Validate every: {validate_every}", file=sys.stderr)
+    print(f"  WS bridge:       ws://127.0.0.1:{ws_port}", file=sys.stderr)
     print(f"  Output: JSON lines to stdout", file=sys.stderr)
     print("═" * 60, file=sys.stderr)
+
+    # 0. Start WebSocket bridge for real-time UI
+    ws_bridge = WSSpectralBridge(port=ws_port)
+    ws_bridge.start()
+    time.sleep(0.2)
 
     # 1. Start spectral receiver thread
     receiver = SpectralReceiver()
@@ -401,6 +409,7 @@ def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile
                         "within_deadband": biggest is None,
                     }
                     emit(finding)
+                    ws_bridge.broadcast_validation(finding)
 
                     # Track improvement/worsening
                     if last_validation_deviation and biggest:
@@ -437,6 +446,13 @@ def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile
                 "frame_count": count,
                 "bands": band_dict,
             })
+            # Normalize to 0-1 for VU meters (per-frame max)
+            max_val = max(abs(v) for v in spectral) if spectral else 1.0
+            if max_val > 0:
+                norm_bands = {b: round(min(v / max_val, 1.0), 4) for b, v in band_dict.items()}
+            else:
+                norm_bands = band_dict
+            ws_bridge.broadcast_bands(norm_bands)
             prev_count = count
 
         # Progress to stderr
@@ -449,7 +465,7 @@ def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile
                 status += f" target={b} {d}({s:.0f}σ)"
             print(status, file=sys.stderr)
 
-        time.sleep(0.005)
+        time.sleep(0.05)  # 20Hz loop — gives UI time to render WS updates
 
     # ── Final validation ──
     if validation and validation.running:
@@ -476,6 +492,7 @@ def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile
 
     emit({"type": "complete", "iterations": iterations, "frames_received": count})
     receiver.stop()
+    ws_bridge.stop()
 
 
 # ═══════════════════════════════════════════
@@ -493,6 +510,10 @@ if __name__ == '__main__':
                         help='Comma-separated reference track indices (e.g. "3,5,12")')
     parser.add_argument('--list-refs', action='store_true',
                         help='List available reference tracks and exit')
+    parser.add_argument('--ws-port', type=int, default=WS_PORT,
+                        help=f'WebSocket bridge port (default: {WS_PORT})')
+    parser.add_argument('--continuous', action='store_true',
+                        help='Run indefinitely (Ctrl+C to stop)')
     args = parser.parse_args()
 
     if args.list_refs:
@@ -516,5 +537,6 @@ if __name__ == '__main__':
             print("ERROR: Failed to build profile", file=sys.stderr)
             sys.exit(1)
 
-    run_analysis_loop(iterations=args.iterations, validate_every=args.validate_every,
-                      profile_path=profile_path)
+    iterations = sys.maxsize if args.continuous else args.iterations
+    run_analysis_loop(iterations=iterations, validate_every=args.validate_every,
+                      profile_path=profile_path, ws_port=args.ws_port)
