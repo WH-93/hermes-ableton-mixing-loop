@@ -1,94 +1,73 @@
-# Hermes ↔ Ableton Closed-Loop Mixing
+# Hermes ↔ Ableton Arrangement Automation
 
-AI-assisted mixing loop: capture Ableton output → spectral analysis → category routing → sigma-scaled EQ adjustment.
+Pure OSC automation tools for Ableton Live 12 via ableton-agent. No MCP, no LivePilot, no spectral analysis — just UDP OSC.
 
 ## Architecture
 
 ```
-audio_analyzer.py    520 lines   Pure analysis (librosa STFT, LUFS, ratio comparison)
-mixing.py            470 lines   Shared logic (120+ role tags, sigma scaling, safety)
-bridge_loop.py       960 lines   Async UDP receiver + aggressive/normal dual-mode
-mix_loop.py          380 lines   Raw TCP transport + standalone CLI (14 commands, legacy)
-orchestrator.py      310 lines   Hermes MCP transport
-tests/               4 files    63 unit tests
+ableton-agent (port 11000/11001) → AbletonOSC Remote Script → Live Object Model
+                ↑
+arrangement_overdub.py    Track volume automation with beat-synced recording
+phaser_mod.py             Multi-parameter FX modulation with φ-geometric rates
+arrangement_builder.py    Clip + automation envelope module
+delay_modulator.py        Continuous delay parameter modulation (13 tracks)
 ```
 
 ## Quick Start
 
 ```bash
-# List reference tracks
-python bridge_loop.py --list-refs
+# Track volume arrangement (6 min, kick+hats bookends)
+python arrangement_overdub.py
 
-# High-speed async loop against specific tracks
-python bridge_loop.py --refs 20,23 -n 30 -v 10
+# Phaser/Flanger modulation (6 min, φ-rate drift)
+python phaser_mod.py
+
+# Continuous delay modulation (runs until Ctrl+C)
+python delay_modulator.py
 ```
 
-## Six Tool Improvements (v3.1)
+All scripts beat-sync to Ableton's transport. Position playhead at bar 1, hit play, then run.
 
-### 1. Sigma-Scaled Deltas
-`scale_delta_for_sigmas(delta_base, sigmas)` — 2σ→1x, 8σ→2x, 20σ+→5x. Big gaps get aggressive moves.
+## Tools
 
-### 2. Aggressive Mode
-Above 20σ, skip bridge direction tracking entirely. Apply fixes and verify on next BlackHole validation. No IMPROVING/WORSE oscillation.
+### arrangement_overdub.py
+Streams `/live/track/set/volume` or `/live/device/set/parameter/value` into arrangement view via overdub recording. Waits for bar boundary before engaging. 6-minute default. Configurable curves, tracks, and duration.
 
-### 3. Candidate Scoring
-Tracks scored by role tag relevance to band name. Bass fixes prefer "bass BASS-FM" (5pts) over "KICK" (2pts).
+### phaser_mod.py
+Rich FX automation for Phaser-Flanger (or any device). Automates Dry/Wet, Amount, Feedback, Spread, Env Amount, Spin, Center Freq, Mod Rates, Mod Freqs. Uses φ-geometric ratios so rates continuously drift in and out of sync. Frequency capped to avoid harshness.
 
-### 4. Stuck Detection
-Detects ceiling hits (no room to move), counts consecutive stuck iterations, labels [STUCK x5], cycles to next candidate.
+### arrangement_builder.py
+Python module: `build_clip_with_automation(track, slot, bars, notes, automation)` and `build_arrangement(tracks_config)`. Creates clips, adds MIDI notes, creates automation envelopes, inserts curve points — all in one call.
 
-### 5. Validation Comparison
-Tracks improved/worse between consecutive BlackHole validations: `✓ improved: bass 46σ → 31σ`.
+### delay_modulator.py
+Runs until terminated. Every 10s: swells Dry/Wet + Feedback + LP Freq on all delay-bearing tracks with unique φ-wave patterns. Every 6s: modulates secondary params on a rotating subset. Supports Echo, Delay, GrainDelay, FilterDelay (3-line independent). Smooth interpolation between swell targets.
 
-### 6. Validation Spawn Fix
-Moved to top of loop so aggressive mode doesn't skip periodic ground truth checks.
+## Remote Script Patches
 
-## Category Routing
+The system AbletonOSC copy (`/Applications/Ableton Live 12 Suite.app/Contents/App-Resources/MIDI Remote Scripts/AbletonOSC/`) needs these fixes:
 
-| Spectral band | Category | Example tracks |
-|---|---|---|
-| sub, bass | low_end | bass BASS-FM, KICK |
-| presence, air | hi_freq | hats 909-HARDCORE |
-| low_mid, mid | synth, mid | PAD, LEAD, CHORD |
+1. **pythonosc/parsing/** — missing submodule, copy from `ableton-agent/.venv`, fix absolute import in `osc_types.py`
+2. **bool(mute)** — `clip.py` line 153: `mute=bool(mute)` (OSC sends int, Live expects bool)
+3. **Automation endpoints** — 5 custom handlers added to `clip.py`: `/live/clip/automation/list`, `create`, `insert_step`, `clear`, `clear_all`
 
-## Band-to-EQ-Filter & Q Mapping
+Clear `__pycache__` and restart Ableton after each change.
 
-Wider spectral gap → wider Q (lower resonance):
+## TDD Tests
 
-| Band | EQ filter | >8σ Q | 4-8σ Q | 2-4σ Q | 1-2σ Q |
-|---|---|---|---|---|---|
-| sub | 1 | 0.15 | 0.30 | 0.50 | 0.70 |
-| bass | 2 | 0.15 | 0.30 | 0.50 | 0.70 |
-| low_mid | 3 | 0.15 | 0.30 | 0.50 | 0.70 |
-| mid | 5 | 0.15 | 0.30 | 0.50 | 0.70 |
-| high_mid | 6 | 0.15 | 0.30 | 0.50 | 0.70 |
-| presence | 7 | 0.15 | 0.30 | 0.50 | 0.70 |
-| air | 8 | 0.15 | 0.30 | 0.50 | 0.70 |
+```bash
+python test_automation.py   # 6/6 — automation envelope handlers
+python test_tier3.py        # 6/6 — full arrangement pipeline
+```
 
-## Track Role Tagging
+## Key Findings
 
-**Convention: first word of track name = role tag.** Case-insensitive, plural-aware. 120+ tags across 7 categories.
+- Bool properties (`arrangement_overdub`, `record_mode`) need `int(1)` not `float(1.0)`
+- `create_automation_envelope(param)` takes the parameter directly, not device+param
+- `insert_step(time, value, slope)` — three doubles
+- `automation_envelopes` is a single-use iterable — must `list()` it
+- One parameter can only have one automation envelope total (Live constraint)
+- `add_notes`: flatten tuples, chunk ≤80 notes, create clip via `/live/clip_slot/create_clip` first
 
-## Safety Features
+## Scrapped
 
-- Sigma-scaled deltas (aggressive on big gaps, surgical on small)
-- Aggressive mode skip-bridge above 20σ
-- EQ8 bipolar clamp [-1, +1]
-- Ceiling/floor detection with stuck escalation
-- Param cache updated after every write
-- ensure_device() adds devices via LivePilot if missing
-- Deadband: no adjustment within 0.8σ
-
-## LivePilot Patches
-
-| File | Command | Impact |
-|------|---------|--------|
-| `devices.py` | `get_all_device_parameters` | 150s scan → 3s |
-| `tracks.py` | `get_all_track_names` | 90s roles → 1s |
-| `server.py` | FAST_WRITE_COMMANDS | 100ms settle → 0ms |
-
-## Known Limitations
-
-- Bridge at 50Hz can't detect <0.05 changes — aggressive mode handles this
-- Stuck escalation needs per-fix-index support (coming)
-- No subjective override channel yet
+The spectral analysis/mixing path (bridge_loop.py, audio_analyzer.py, techno-ui, ws_bridge.py, ws_inject.py) has been abandoned. All current functionality is pure OSC through ableton-agent.
