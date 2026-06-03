@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Async bridge-based mixing loop — continuous spectral stream + pipelined analysis.
+Bridge spectral analysis engine — emits JSON findings for agent-driven control.
 
 Architecture:
   Receiver thread:  binds UDP 9880, continuously reads spectral packets,
                     updates a thread-safe latest_spectrum buffer.
-  Main thread:      grabs latest spectrum (non-blocking), analyzes, applies fixes.
-                    BlackHole validation spawned async — main loop doesn't pause.
+  Main thread:      grabs latest spectrum (non-blocking), periodically spawns
+                    BlackHole validation, emits JSON findings to stdout.
+  NO control logic: No parameter writes, no device discovery, no candidate
+                    scoring. All adjustments go through ableton-agent OSC.
 
-Latency per iteration: analysis time + UDP write (~5-20ms)
-  vs. old loop:  20× UDP read (~200ms) + analysis + write
-  vs. TCP loop:  TCP round-trip (~300ms) + scan + analysis + write (~15-30s)
+Output: JSON lines to stdout — one finding per significant event.
+  {"type": "validation", "iteration": 10, "elapsed": 5.2, "band_issues": [...], "biggest": {...}}
+  {"type": "spectral", "iteration": 15, "bands": {...}}
 
-Bridge spectral stream runs at ~50Hz; we read the latest frame whenever we're ready.
-No blocking reads, no artificial delays.
+Usage:
+  bridge_loop.py --refs 20,23 -n 50           # output JSON findings
+  bridge_loop.py --list-refs                   # list reference tracks
 """
 
 import json
@@ -41,13 +44,11 @@ from mixing import (
 )
 
 BRIDGE_RX = 9880
-BRIDGE_TX = 9882  # set_param commands (separate from spectral stream's udpsend 9880)
 VALIDATION_INTERVAL = 10  # BlackHole ground truth every N iterations
 BANDS = ['sub', 'bass', 'low_mid', 'mid', 'high_mid', 'presence', 'air']
 BAND_INDEX_MAP = {'sub': 0, 'bass': 1, 'low_mid': 2, 'mid': 3, 'high_mid': 4, 'presence': 5, 'air': 6}
 
 # EQ Eight has 8 filters. Map each spectral band to the closest filter number.
-# Filter 1 = lowest freq (sub), Filter 8 = highest (air).
 BAND_TO_EQ_FILTER = {
     'sub': 1,        # 20-60Hz
     'bass': 2,       # 60-120Hz
@@ -65,14 +66,14 @@ def sigmas_to_q(sigmas):
     Small gap → narrow Q (high resonance) for surgical fix.
     Returns resonance value 0.0-1.0 (EQ Eight: 0=wide, 1=narrow)."""
     if sigmas > 8:
-        return 0.15   # very wide — whole region needs fixing
+        return 0.15
     elif sigmas > 4:
-        return 0.30   # wide
+        return 0.30
     elif sigmas > 2:
-        return 0.50   # medium
+        return 0.50
     elif sigmas > 1:
-        return 0.70   # narrow — surgical
-    return None        # within deadband
+        return 0.70
+    return None
 
 
 # ═══════════════════════════════════════════
@@ -80,7 +81,6 @@ def sigmas_to_q(sigmas):
 # ═══════════════════════════════════════════
 
 def list_reference_tracks():
-    """Return list of (index, filename) for all reference tracks."""
     if not os.path.isdir(REF_DIR):
         return []
     tracks = []
@@ -97,7 +97,6 @@ def list_reference_tracks():
 
 
 def print_reference_tracks(tracks):
-    """Print numbered list of reference tracks."""
     print(f"\n  {len(tracks)} reference tracks in {REF_DIR}:")
     for i, fp in enumerate(tracks):
         name = os.path.basename(fp)
@@ -105,39 +104,32 @@ def print_reference_tracks(tracks):
 
 
 def build_profile_from_indices(track_paths, indices):
-    """Build aggregate profile from selected track paths by index (1-based).
-    Uses per-track cache (~/.hermes/data/deepspace_per_track/) for instant load.
-    Returns path to profile JSON, or None on failure."""
     cache_dir = os.path.expanduser("~/.hermes/data/deepspace_per_track")
-
     selected = []
     for idx in sorted(set(indices)):
         if 1 <= idx <= len(track_paths):
             selected.append(track_paths[idx - 1])
-
     if not selected:
         return None
 
-    print(f"\n  Building profile from {len(selected)} track(s):")
+    print(f"\n  Building profile from {len(selected)} track(s):", file=sys.stderr)
     analyses = []
 
     for fp in selected:
         name = os.path.basename(fp)
         cache_path = os.path.join(cache_dir, name + '.json')
-        print(f"    - {name}", end='')
+        print(f"    - {name}", end='', file=sys.stderr)
 
-        # Try cache first (instant)
         if os.path.exists(cache_path):
             try:
                 with open(cache_path) as f:
                     analyses.append(json.load(f))
-                print("  [cached]")
+                print("  [cached]", file=sys.stderr)
                 continue
             except Exception:
                 pass
 
-        # Fallback: live analysis (~7s per track)
-        print("  [analyzing...]", end='', flush=True)
+        print("  [analyzing...]", end='', flush=True, file=sys.stderr)
         try:
             r = subprocess.run(
                 [PYTHON, ANALYZER, "analyze", fp],
@@ -145,20 +137,18 @@ def build_profile_from_indices(track_paths, indices):
             )
             if r.returncode == 0:
                 analyses.append(json.loads(r.stdout))
-                # Save to cache for next time
                 os.makedirs(cache_dir, exist_ok=True)
                 with open(cache_path, 'w') as f:
                     f.write(r.stdout)
-                print(" ✓")
+                print(" ✓", file=sys.stderr)
             else:
-                print(f" ✗ failed")
+                print(" ✗ failed", file=sys.stderr)
         except Exception as e:
-            print(f" ✗ {e}")
+            print(f" ✗ {e}", file=sys.stderr)
 
     if not analyses:
         return None
 
-    # Aggregate (same logic as build_profile in audio_analyzer.py)
     import numpy as np
     numeric_keys = [
         "lufs_integrated", "peak_db", "rms_db", "crest_factor_db",
@@ -200,13 +190,12 @@ def build_profile_from_indices(track_paths, indices):
             }
         profile[band_type] = band_agg
 
-    # Save to temp profile
     fd, profile_path = tempfile.mkstemp(suffix='.json', prefix='ref_profile_')
     os.close(fd)
     with open(profile_path, 'w') as f:
         json.dump(profile, f, indent=2)
 
-    print(f"    ✓ Profile saved: {profile_path}")
+    print(f"    ✓ Profile saved: {profile_path}", file=sys.stderr)
     return profile_path
 
 
@@ -215,14 +204,12 @@ def build_profile_from_indices(track_paths, indices):
 # ═══════════════════════════════════════════
 
 class SpectralReceiver(threading.Thread):
-    """Continuously reads spectral packets from UDP 9880 in a background thread.
-    Main thread calls get_latest() for the most recent frame (non-blocking).
-    """
+    """Continuously reads spectral packets from UDP 9880 in a background thread."""
 
     def __init__(self):
         super().__init__(daemon=True)
         self._lock = threading.Lock()
-        self._latest = None       # list of 7 floats
+        self._latest = None
         self._timestamp = 0.0
         self._count = 0
         self._running = False
@@ -243,7 +230,6 @@ class SpectralReceiver(threading.Thread):
             except OSError:
                 break
 
-            # Parse OSC: find /spectral_shape
             null = data.find(b'\x00')
             if null < 0:
                 continue
@@ -251,14 +237,12 @@ class SpectralReceiver(threading.Thread):
             if addr != '/spectral_shape':
                 continue
 
-            # Skip type tag string
             pos = (null + 4) & ~3
             tag_end = data.find(b'\x00', pos)
             if tag_end < 0:
                 continue
             pos = (tag_end + 4) & ~3
 
-            # Parse 7 float32 values
             values = []
             for _ in range(7):
                 if pos + 4 > len(data):
@@ -273,7 +257,6 @@ class SpectralReceiver(threading.Thread):
                     self._count += 1
 
     def get_latest(self):
-        """Non-blocking. Returns (values, timestamp, count) or (None, 0, 0)."""
         with self._lock:
             return self._latest, self._timestamp, self._count
 
@@ -287,36 +270,11 @@ class SpectralReceiver(threading.Thread):
 
 
 # ═══════════════════════════════════════════
-# BRIDGE COMMAND SENDER — fire and forget
-# ═══════════════════════════════════════════
-
-class BridgeSender:
-    """Parameter writer via M4L bridge UDP. Fire-and-forget — writes
-    are confirmed via BlackHole validation, not per-write responses."""
-
-    def __init__(self):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    def set_param(self, track_idx, device_idx, param_idx, value):
-        """Send /set_param OSC command to bridge port 9882."""
-        addr = b'/set_param\x00\x00'
-        types = b',iiif\x00'
-        args = struct.pack('>iiif', track_idx, device_idx, param_idx, float(value))
-        self._sock.sendto(addr + types + args, ('127.0.0.1', 9882))
-
-    def close(self):
-        try:
-            self._sock.close()
-        except Exception:
-            pass
-
-
-# ═══════════════════════════════════════════
 # BLACKHOLE VALIDATION — async subprocess
 # ═══════════════════════════════════════════
 
 class AsyncValidation:
-    """Spawn ffmpeg capture + analysis in background. Main loop polls for result."""
+    """Spawn ffmpeg capture + analysis in background."""
 
     def __init__(self, profile_path=None):
         self._process = None
@@ -324,11 +282,9 @@ class AsyncValidation:
         self._profile_path = profile_path or PROFILE
 
     def start(self):
-        """Launch ffmpeg capture → analysis in background."""
         fd, self._wav_path = tempfile.mkstemp(suffix='.wav')
         os.close(fd)
 
-        # Capture 4s of audio via BlackHole
         self._process = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'avfoundation', '-i', ':2',
              '-t', '4', '-ar', '22050', '-ac', '2', '-c:a', 'pcm_s16le',
@@ -338,16 +294,10 @@ class AsyncValidation:
         self._start_time = time.time()
 
     def poll(self):
-        """Check if capture+analysis is done. Returns comparison dict or None."""
         if self._process is None:
             return None
-
-        # Check if ffmpeg finished
         if self._process.poll() is None:
-            # Still running
             return None
-
-        # ffmpeg done — run analysis
         if self._process.returncode != 0:
             self._cleanup()
             return {"error": f"ffmpeg exited {self._process.returncode}"}
@@ -385,288 +335,88 @@ class AsyncValidation:
 
 
 # ═══════════════════════════════════════════
-# TCP FALLBACK — for track/device discovery
+# MAIN ANALYSIS LOOP — JSON output only
 # ═══════════════════════════════════════════
 
-import socket as sock_module
-
-def tcp_call(cmd, params=None, timeout=10):
-    s = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(('127.0.0.1', 9878))
-        s.sendall(json.dumps({'id':'x','type':cmd,'params':params or {}}).encode()+b'\n')
-        r = b''
-        while True:
-            try:
-                c = s.recv(65536)
-                if not c: break
-                r += c
-            except: break
-        for line in r.decode().strip().split('\n'):
-            if line.strip():
-                try: return json.loads(line)
-                except: pass
-        return {'ok': False}
-    finally:
-        s.close()
-
-_track_cache = {}
-_param_cache = {}
-
-def get_track_names():
-    r = tcp_call('get_all_track_names', timeout=10)
-    return r['result']['tracks'] if r.get('ok') else []
-
-def ensure_device(ti, device_name):
-    """Ensure a native Live device exists on the track. Adds it if missing.
-    Returns the device index, or -1 on failure."""
-    devs = get_track_devices(ti)
-    for d in devs:
-        if device_name.lower() in d['name'].lower():
-            return d['index']
-
-    # Not found — insert via LivePilot
-    print(f"     ＋ adding {device_name} to track {ti}...", end='', flush=True)
-    r = tcp_call('insert_device', {'track_index': ti, 'device_name': device_name}, timeout=10)
-    if r.get('ok'):
-        # Invalidate cache so next get_track_devices re-fetches
-        if ti in _track_cache:
-            del _track_cache[ti]
-        devs = get_track_devices(ti)
-        for d in devs:
-            if device_name.lower() in d['name'].lower():
-                print(f" ✓ (index {d['index']})")
-                return d['index']
-    print(f" ✗ failed: {r.get('error', r)}")
-    return -1
+def emit(obj):
+    """Write JSON finding to stdout."""
+    print(json.dumps(obj))
+    sys.stdout.flush()
 
 
-def get_track_devices(ti):
-    if ti in _track_cache:
-        return _track_cache[ti]
-    r = tcp_call('get_track_info', {'track_index': ti}, timeout=4)
-    if not r.get('ok'): return []
-    devs = [{'index': di, 'name': d.get('name','')} for di, d in enumerate(r['result'].get('devices',[]))]
-    _track_cache[ti] = devs
-    return devs
-
-def get_device_params(ti, di):
-    r = tcp_call('get_device_parameters', {'track_index': ti, 'device_index': di}, timeout=6)
-    if not r.get('ok'): return {}
-    return {p['name'].lower(): {'index': p['index'], 'value': p['value']}
-            for p in r['result'].get('parameters', [])}
-
-def get_cached_param_index(ti, di, param_hints, band_name=None):
-    """Find param index matching hints. For EQ Eight, uses band_name
-    to target the correct filter (e.g. 'bass' → filter 2 gain, not filter 1).
-    Returns (index, param_name) or (None, None)."""
-    key = (ti, di)
-    if key not in _param_cache:
-        _param_cache[key] = get_device_params(ti, di)
-    params = _param_cache[key]
-
-    # If band specified and device looks like EQ, prefer band-specific filter
-    if band_name and band_name in BAND_TO_EQ_FILTER:
-        filter_num = BAND_TO_EQ_FILTER[band_name]
-        for hint in param_hints:
-            hint_lower = hint.lower()
-            # Try band-specific first: "2 gain a" for bass
-            filter_prefix = f"{filter_num} {hint_lower}"
-            for pname, pinfo in params.items():
-                if filter_prefix in pname:
-                    return pinfo['index'], pname
-            # Fallback: adjacent band
-            for offset in [1, -1, 2, -2]:
-                alt = filter_num + offset
-                if 1 <= alt <= 8:
-                    alt_prefix = f"{alt} {hint_lower}"
-                    for pname, pinfo in params.items():
-                        if alt_prefix in pname:
-                            return pinfo['index'], pname
-
-    # Generic fallback: substring match
-    for hint in param_hints:
-        hint_lower = hint.lower()
-        for pname, pinfo in params.items():
-            if hint_lower in pname:
-                return pinfo['index'], pname
-    return None, None
-
-
-def get_resonance_index(ti, di, gain_param_name):
-    """Given a gain param like '2 gain a', find the matching resonance param
-    ('2 resonance a') and return its index, or None."""
-    key = (ti, di)
-    if key not in _param_cache:
-        _param_cache[key] = get_device_params(ti, di)
-    params = _param_cache[key]
-
-    # Replace 'gain' with 'resonance' in the param name
-    res_name = gain_param_name.replace('gain', 'resonance')
-    if res_name in params:
-        return params[res_name]['index']
-    # Also try without 'a'/'b' suffix
-    base = gain_param_name.rsplit(' ', 1)[0]  # "2 gain"
-    for suffix in ['a', 'b']:
-        candidate = f"{base.replace('gain', 'resonance')} {suffix}"
-        if candidate in params:
-            return params[candidate]['index']
-    return None
-
-
-# ═══════════════════════════════════════════
-# ANALYSIS — compute fix from spectral delta
-# ═══════════════════════════════════════════
-
-# Bridge raw values are 0-1 energy, reference profile is dB (30-45).
-# Bridge data is ONLY used for relative movement tracking between validations.
-# BlackHole validation provides the absolute ground truth comparison.
-
-_last_validation_deviation = None  # (band, direction, sigmas) from last BlackHole check
-_last_validation_spectral = None   # bridge spectral at time of validation
-_stuck_counter = 0                 # consecutive iterations on same band+direction
-_stuck_band = None                 # band+direction combination we're tracking
-_dead_fix_indices = set()          # fix indices at ceiling/floor — skip permanently this cycle
-MAX_STUCK_ITERATIONS = 5           # escalate after this many stuck iterations
-
-
-def set_validation_ground_truth(comparison_result, current_spectral=None):
-    """Called after each BlackHole validation to set the ground truth target."""
-    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _stuck_band, _dead_fix_indices
-    if not comparison_result or 'error' in comparison_result:
-        return
-    band_issues = comparison_result.get('band_issues', [])
-    new_deviation = find_biggest_deviation(band_issues)
-
-    # Reset dead fix tracking when band changes
-    if (not _last_validation_deviation or
-        _last_validation_deviation[:2] != new_deviation[:2]):
-        _dead_fix_indices.clear()
-        _stuck_counter = 0
-
-    # Track improvement/worsening for diagnostics only
-    if _last_validation_deviation and new_deviation:
-        old_band, old_dir, old_sigmas = _last_validation_deviation
-        new_band, new_dir, new_sigmas = new_deviation
-        if old_band == new_band and old_dir == new_dir:
-            if new_sigmas < old_sigmas:
-                print(f"     ✓ improved: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
-            elif new_sigmas >= old_sigmas * 1.1:
-                print(f"     ✗ worse: {old_band} {old_sigmas:.1f}σ → {new_sigmas:.1f}σ")
-                _stuck_counter += 1
-            else:
-                _stuck_counter += 1
-
-    _last_validation_deviation = new_deviation
-    if current_spectral and _last_validation_deviation:
-        _last_validation_spectral = list(current_spectral)
-
-
-def get_band_direction(current_spectral, band_name):
-    """Check if bridge band is moving up/down relative to last ground truth.
-    Returns 'improving', 'worsening', or 'stable'.
-    """
-    global _last_validation_spectral, _last_validation_deviation
-    if not _last_validation_deviation or not _last_validation_spectral:
-        return 'stable'
-
-    target_band, target_direction, _ = _last_validation_deviation
-    if band_name != target_band:
-        return 'stable'
-
-    band_idx = BAND_INDEX_MAP.get(band_name, 0)
-    delta = current_spectral[band_idx] - _last_validation_spectral[band_idx]
-
-    if target_direction == 'weak' and delta > 0.001:
-        return 'improving'
-    elif target_direction == 'hot' and delta < -0.001:
-        return 'improving'
-    elif abs(delta) < 0.001:
-        return 'stable'
-    else:
-        return 'worsening'
-
-
-def checkpoint_spectral(spectral):
-    """Store current spectral as the reference point. Called after applying a fix."""
-    global _last_validation_spectral
-    _last_validation_spectral = list(spectral)
-
-
-# ═══════════════════════════════════════════
-# MAIN ASYNC LOOP
-# ═══════════════════════════════════════════
-
-def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
-    global _last_validation_deviation, _last_validation_spectral, _stuck_counter, _dead_fix_indices
+def run_analysis_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_path=None):
     profile_path = profile_path or PROFILE
 
-    print("═" * 60)
-    print("Bridge Async Mixing Loop")
-    print(f"  Architecture:  receiver thread + analysis pipeline")
-    print(f"  Max iterations: {iterations}")
-    print(f"  Validate every: {validate_every}")
-    print("═" * 60)
+    print("═" * 60, file=sys.stderr)
+    print("Bridge Analysis Engine — agent-driven control mode", file=sys.stderr)
+    print(f"  Max iterations: {iterations}", file=sys.stderr)
+    print(f"  Validate every: {validate_every}", file=sys.stderr)
+    print(f"  Output: JSON lines to stdout", file=sys.stderr)
+    print("═" * 60, file=sys.stderr)
 
     # 1. Start spectral receiver thread
     receiver = SpectralReceiver()
     receiver.start()
-    time.sleep(0.3)  # let it start and get first packets
+    time.sleep(0.3)
     if not receiver.is_alive():
-        print("ERROR: Receiver thread didn't start. Is the bridge running?")
+        emit({"type": "error", "message": "Receiver thread failed to start"})
         return
 
     _, _, init_count = receiver.get_latest()
     if init_count == 0:
-        print("ERROR: No spectral packets received. Is Ableton playing?")
+        emit({"type": "error", "message": "No spectral packets received. Is Ableton playing?"})
         receiver.stop()
         return
-    print(f"\n✓ Receiver thread alive — {init_count} packets buffered\n")
 
-    # 2. Get track info via TCP (once)
-    track_names = get_track_names()
-    tagged = sum(1 for t in track_names if parse_track_role(t.get('name','')))
-    print(f"  {len(track_names)} tracks, {tagged} tagged\n")
+    print(f"\n✓ Receiver alive — {init_count} packets buffered\n", file=sys.stderr)
 
-    # 4. Bridge sender
-    bridge = BridgeSender()
-
-    # 5. State
-    prev_spectral = None
+    # 2. State
+    last_validation_deviation = None
     prev_count = init_count
     validation = None
-    last_fix_info = None  # (track_idx, device_idx, param_idx, delta, band, direction)
-    applied_fix = False   # whether we just applied a fix
-
-    print("Starting main loop...\n")
+    prev_band_issues = None
+    count = init_count
 
     for i in range(iterations):
         t0 = time.time()
 
-        # Check for completed validation
+        # ── Check for completed validation ──
         if validation is not None:
             result = validation.poll()
             if result is not None:
                 if 'error' not in result:
                     band_issues = result.get('band_issues', [])
                     biggest = find_biggest_deviation(band_issues)
-                    if biggest:
-                        band, direction, sigmas = biggest
-                        print(f"  📊 VALIDATION #{i+1}: {band} {direction} ({sigmas:.1f}σ) — {validation.elapsed():.1f}s")
-                        set_validation_ground_truth(result, spectral)
-                        # Force first fix on next iteration
-                        applied_fix = False
-                    else:
-                        print(f"  📊 VALIDATION #{i+1}: all bands within deadband ✓ — {validation.elapsed():.1f}s")
-                        _last_validation_deviation = None
+
+                    finding = {
+                        "type": "validation",
+                        "iteration": i + 1,
+                        "elapsed": round(validation.elapsed(), 1),
+                        "band_issues": band_issues,
+                        "biggest": {
+                            "band": biggest[0],
+                            "direction": biggest[1],
+                            "sigmas": biggest[2],
+                        } if biggest else None,
+                        "within_deadband": biggest is None,
+                    }
+                    emit(finding)
+
+                    # Track improvement/worsening
+                    if last_validation_deviation and biggest:
+                        old_band, old_dir, old_sigmas = last_validation_deviation
+                        if old_band == biggest[0] and old_dir == biggest[1]:
+                            trend = "improved" if biggest[2] < old_sigmas else "worsened"
+                            print(f"     {trend}: {old_band} {old_sigmas:.1f}σ → {biggest[2]:.1f}σ", file=sys.stderr)
+
+                    last_validation_deviation = biggest
+                    prev_band_issues = band_issues
                 else:
-                    print(f"  📊 VALIDATION #{i+1}: FAILED — {result['error']}")
+                    emit({"type": "error", "message": result['error'], "iteration": i + 1})
                 validation = None
 
         # ── Get latest spectrum ──
         spectral, ts, count = receiver.get_latest()
-
         if spectral is None:
             time.sleep(0.005)
             continue
@@ -675,282 +425,66 @@ def run_async_loop(iterations=50, validate_every=VALIDATION_INTERVAL, profile_pa
         if (i + 1) % validate_every == 0 and validation is None:
             validation = AsyncValidation(profile_path)
             validation.start()
-            print(f"  ⏳ BlackHole validation started (will resolve in ~5s)...")
-            applied_fix = False  # reset — ground truth about to refresh
+            print(f"  ⏳ BlackHole validation started...", file=sys.stderr)
 
-        # ── If no ground truth yet, skip analysis ──
-        if _last_validation_deviation is None:
-            # Validation takes ~5s — slow poll until it finishes
+        # ── Periodic spectral sample (every ~2s, ~100 frames) ──
+        if count - prev_count >= 100:
+            band_dict = dict(zip(BANDS, [round(v, 4) for v in spectral]))
+            emit({
+                "type": "spectral",
+                "iteration": i + 1,
+                "timestamp": round(ts, 2),
+                "frame_count": count,
+                "bands": band_dict,
+            })
+            prev_count = count
+
+        # Progress to stderr
+        if i % 20 == 0:
+            status = f"[{i+1:3d}] frames={count}"
             if validation and validation.running:
-                print(f"[{i+1:3d}] ⏳ waiting for first validation ({validation.elapsed():.1f}s elapsed)")
-                time.sleep(0.5)
-            else:
-                print(f"[{i+1:3d}] ⏳ waiting for first validation  ({time.time()-t0:.3f}s)")
-                # Spawn first validation if not already running
-                if validation is None:
-                    validation = AsyncValidation(profile_path)
-                    validation.start()
-                    print(f"  ⏳ BlackHole validation started...")
-                time.sleep(0.5)
-            prev_spectral = spectral
-            continue
+                status += f" validating({validation.elapsed():.0f}s)"
+            if last_validation_deviation:
+                b, d, s = last_validation_deviation
+                status += f" target={b} {d}({s:.0f}σ)"
+            print(status, file=sys.stderr)
 
-        target_band, target_direction, target_sigmas = _last_validation_deviation
+        time.sleep(0.005)
 
-        # ── Above threshold: skip bridge direction, apply aggressively ──
-        if target_sigmas >= SKIP_BRIDGE_THRESHOLD:
-            # Bridge can't reliably detect <0.1 changes — just apply and verify on next validation
-            stuck_label = f" [STUCK x{_stuck_counter}]" if _stuck_counter >= MAX_STUCK_ITERATIONS else ""
-            print(f"[{i+1:3d}] 🚀 {target_band:10s} {target_direction:4s} ({target_sigmas:.0f}σ) aggressive{stuck_label}  ({time.time()-t0:.3f}s)")
-
-            # If stuck, try next fix action or different track — skip dead indices
-            fix_idx = 0
-            while fix_idx in _dead_fix_indices:
-                fix_idx += 1
-            if _stuck_counter >= MAX_STUCK_ITERATIONS:
-                fix_idx = max(fix_idx, 1)  # at least try fix #1 when stuck
-                while fix_idx in _dead_fix_indices:
-                    fix_idx += 1
-            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i, fix_idx=fix_idx)
-            if fix:
-                # If stuck, try next candidate track
-                stuck_offset = _stuck_counter // MAX_STUCK_ITERATIONS
-                scored = []
-                for t in track_names:
-                    if t.get('mute'):
-                        continue
-                    cat = get_track_category(t['name'])
-                    role = parse_track_role(t['name'])
-                    if role and role == target_band:
-                        score = 5
-                    elif cat and category_matches_recommendation(cat, rec_text):
-                        score = 2
-                    elif cat is None:
-                        score = 0
-                    else:
-                        continue
-                    score += (len(track_names) - t['index']) * 0.01
-                    scored.append((score, t))
-                scored.sort(key=lambda x: -x[0])
-                candidates = [s[1] for s in scored[:5]]
-                if not candidates:
-                    candidates = [t for t in track_names if not t.get('mute')]
-
-                # Pick candidate based on stuck offset (cycle through top matches)
-                cand = candidates[min(stuck_offset, len(candidates) - 1)]
-                match = None
-                devs = get_track_devices(cand['index'])
-                for dev in devs:
-                    if any(dt.lower() in dev['name'].lower() for dt in fix['devices']):
-                        match = (cand['index'], dev['index'], dev['name'], cand['name'])
-                        break
-
-                if match:
-                    ti, di, dname, tname = match
-                    pidx, pname = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
-                    if pidx is None:
-                        pidx, pname = get_cached_param_index(ti, di, fix['params'])
-                    if pidx is not None:
-                        key = (ti, di)
-                        current_val = 0.5
-                        if key in _param_cache:
-                            for _pn, pinfo in _param_cache[key].items():
-                                if pinfo['index'] == pidx:
-                                    current_val = pinfo['value']
-                                    break
-                        delta = scale_delta_for_sigmas(fix['delta_base'], target_sigmas)
-                        new_val = max(-1.0, min(1.0, current_val + delta))
-
-                        # Detect ceiling/floor hit
-                        if abs(new_val - current_val) < 0.001:
-                            print(f"     ⚠ {dname}({tname}) {pname} at limit ({current_val:.2f}) — stuck")
-                            _dead_fix_indices.add(fix_idx)  # permanently skip this fix
-                            _stuck_counter += 1
-                        else:
-                            bridge.set_param(ti, di, pidx, new_val)
-                            if key in _param_cache:
-                                for _pn, pinfo in _param_cache[key].items():
-                                    if pinfo['index'] == pidx:
-                                        pinfo['value'] = new_val
-                                        break
-                            q_val = sigmas_to_q(target_sigmas)
-                            if q_val is not None:
-                                ridx = get_resonance_index(ti, di, pname)
-                                if ridx is not None:
-                                    bridge.set_param(ti, di, ridx, q_val)
-                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val or '-'}")
-                            _stuck_counter = 0
-                    else:
-                        print(f"     ⚠ no param '{fix['params']}' in {dname}({tname})")
-                        _stuck_counter += 1
-                else:
-                    print(f"     ⚠ no {fix['devices']} on {cand['name']}")
-                    # Try adding the device via LivePilot
-                    for dev_name in fix['devices']:
-                        di = ensure_device(cand['index'], dev_name)
-                        if di >= 0:
-                            # Device added — retry match
-                            match = (cand['index'], di, dev_name, cand['name'])
-                            break
-                    if not match:
-                        _stuck_counter += 1
-            time.sleep(0.2)  # cooldown for aggressive mode
-            prev_spectral = spectral
-            continue
-
-        # ── Normal mode: check bridge direction ──
-        movement = get_band_direction(spectral, target_band)
-        # (rest of existing movement logic continues below...)
-
-        if movement == 'improving':
-            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} IMPROVING  ({time.time()-t0:.3f}s)")
-            # Update checkpoint — this is the new baseline
-            checkpoint_spectral(spectral)
-        elif not applied_fix or movement == 'stable':
-            # First fix after validation, or stable → apply next adjustment
-            label = "applying fix" if not applied_fix else "stable — applying next fix"
-            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} {label}  ({time.time()-t0:.3f}s)")
-            # Apply the fix
-            fix, rec_text, _ = map_band_to_fix(target_band, target_direction, i, fix_idx=fix_idx)
-            if fix:
-                # Score candidates: prefer tracks whose role tag matches the band name
-                # "bass" fixes should prefer "bass BASS-FM" over "KICK"
-                scored = []
-                for t in track_names:
-                    if t.get('mute'):
-                        continue
-                    cat = get_track_category(t['name'])
-                    role = parse_track_role(t['name'])
-                    # Score: role matches band name → 5, same category → 2, untagged → 0
-                    if role and role == target_band:
-                        score = 5
-                    elif cat and category_matches_recommendation(cat, rec_text):
-                        score = 2
-                    elif cat is None:
-                        score = 0
-                    else:
-                        continue  # wrong category entirely
-                    # Bonus: lower track index (earlier in chain) → +0.1
-                    score += (len(track_names) - t['index']) * 0.01
-                    scored.append((score, t))
-                scored.sort(key=lambda x: -x[0])
-                candidates = [s[1] for s in scored[:5]]
-                if not candidates:
-                    candidates = [t for t in track_names if not t.get('mute')]
-
-                match = None
-                for cand in candidates[:5]:
-                    devs = get_track_devices(cand['index'])
-                    for dev in devs:
-                        if any(dt.lower() in dev['name'].lower() for dt in fix['devices']):
-                            match = (cand['index'], dev['index'], dev['name'], cand['name'])
-                            break
-                    if match: break
-
-                if match:
-                    ti, di, dname, tname = match
-                    pidx, pname = get_cached_param_index(ti, di, fix['params'], band_name=target_band)
-
-                    if pidx is None:
-                        # Try generic 'gain' match as fallback (e.g. 'Output Gain')
-                        pidx, pname = get_cached_param_index(ti, di, fix['params'])
-                        if pidx is not None:
-                            print(f"     ⚠ band '{target_band}' param not found, using '{pname}' fallback")
-                        else:
-                            print(f"     ⚠ no matching param in {dname} (band '{target_band}')")
-                            continue
-
-                    # Get current value for relative adjustment
-                    key = (ti, di)
-                    current_val = 0.5  # default midpoint
-                    if key in _param_cache:
-                        for _pn, pinfo in _param_cache[key].items():
-                            if pinfo['index'] == pidx:
-                                current_val = pinfo['value']
-                                break
-                    delta = scale_delta_for_sigmas(fix['delta_base'], target_sigmas)
-                    new_val = max(-1.0, min(1.0, current_val + delta))  # EQ8 gain is bipolar
-                    bridge.set_param(ti, di, pidx, new_val)
-                    # Update cache so next read shows the new value
-                    if key in _param_cache:
-                        for _pn, pinfo in _param_cache[key].items():
-                            if pinfo['index'] == pidx:
-                                pinfo['value'] = new_val
-                                break
-
-                    # ── Q adjustment: wider gap → wider Q (lower resonance) ──
-                    q_val = sigmas_to_q(target_sigmas)
-                    if q_val is not None:
-                        ridx = get_resonance_index(ti, di, pname)
-                        if ridx is not None:
-                            bridge.set_param(ti, di, ridx, q_val)
-                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f}) Q={q_val:.2f}")
-                        else:
-                            print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
-                    else:
-                        print(f"     ✏️  {dname}({tname}) {pname} Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
-
-                    last_fix_info = (ti, di, pidx, delta, target_band, target_direction)
-                    checkpoint_spectral(spectral)  # baseline BEFORE fix
-                    applied_fix = True
-
-                    # Above threshold: skip bridge direction check — apply and trust
-                    if target_sigmas >= SKIP_BRIDGE_THRESHOLD:
-                        time.sleep(0.2)  # longer cooldown for aggressive moves
-                    else:
-                        time.sleep(0.05)  # standard cooldown
-                else:
-                    print(f"     ⚠ no matching device for {rec_text}")
-            else:
-                print(f"     ⚠ no fix mapping for {target_band}/{target_direction}")
-        elif movement == 'worsening':
-            print(f"[{i+1:3d}] ⚠️  {target_band:10s} {target_direction:4s} WORSE — reversing  ({time.time()-t0:.3f}s)")
-            # Reverse last fix
-            if last_fix_info:
-                ti, di, pidx, delta, _, _ = last_fix_info
-                # Reverse: subtract delta from current value
-                key = (ti, di)
-                current_val = 0.5
-                if key in _param_cache:
-                    for pname, pinfo in _param_cache[key].items():
-                        if pinfo['index'] == pidx:
-                            current_val = pinfo['value']
-                            break
-                new_val = max(-1.0, min(1.0, current_val - delta))  # EQ8 gain is bipolar
-                bridge.set_param(ti, di, pidx, new_val)
-                # Update cache
-                if key in _param_cache:
-                    for _pn, pinfo in _param_cache[key].items():
-                        if pinfo['index'] == pidx:
-                            pinfo['value'] = new_val
-                            break
-                print(f"     ↩  reversed Δ{delta:+.2f} ({current_val:.2f}→{new_val:.2f})")
-                applied_fix = False
-        else:
-            print(f"[{i+1:3d}] 🌉 {target_band:10s} {target_direction:4s} monitoring  ({time.time()-t0:.3f}s)")
-
-        prev_spectral = spectral
-        time.sleep(0.005)  # prevent CPU spin; bridge streams at ~50Hz
-
-    # ── Cleanup ──
-    print(f"\n{'═'*60}")
+    # ── Final validation ──
     if validation and validation.running:
-        print("Waiting for final validation...")
+        print("Waiting for final validation...", file=sys.stderr)
         while validation.running:
             time.sleep(0.5)
         result = validation.poll()
         if result and 'error' not in result:
-            print(f"Final: {len(result.get('band_issues',[]))} issues")
-    print("Loop complete")
-    print(f"{'═'*60}")
+            band_issues = result.get('band_issues', [])
+            biggest = find_biggest_deviation(band_issues)
+            emit({
+                "type": "validation",
+                "iteration": iterations,
+                "elapsed": round(validation.elapsed(), 1),
+                "band_issues": band_issues,
+                "biggest": {
+                    "band": biggest[0],
+                    "direction": biggest[1],
+                    "sigmas": biggest[2],
+                } if biggest else None,
+                "within_deadband": biggest is None,
+                "final": True,
+            })
 
+    emit({"type": "complete", "iterations": iterations, "frames_received": count})
     receiver.stop()
-    bridge.close()
 
+
+# ═══════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Async bridge-based mixing loop')
+    parser = argparse.ArgumentParser(description='Bridge spectral analysis engine — JSON output')
     parser.add_argument('-n', '--iterations', type=int, default=50,
                         help='Max iterations (default: 50)')
     parser.add_argument('-v', '--validate-every', type=int, default=VALIDATION_INTERVAL,
@@ -961,29 +495,26 @@ if __name__ == '__main__':
                         help='List available reference tracks and exit')
     args = parser.parse_args()
 
-    # --list-refs: print and exit
     if args.list_refs:
         tracks = list_reference_tracks()
         print_reference_tracks(tracks)
         sys.exit(0)
 
-    # --refs: build targeted profile
     profile_path = PROFILE
     if args.refs:
         tracks = list_reference_tracks()
         if not tracks:
-            print("ERROR: No reference tracks found in", REF_DIR)
+            print("ERROR: No reference tracks found in", REF_DIR, file=sys.stderr)
             sys.exit(1)
         try:
             indices = [int(x.strip()) for x in args.refs.split(',')]
         except ValueError:
-            print("ERROR: --refs must be comma-separated numbers, e.g. '3,5,12'")
+            print("ERROR: --refs must be comma-separated numbers", file=sys.stderr)
             sys.exit(1)
-
         profile_path = build_profile_from_indices(tracks, indices)
         if not profile_path:
-            print("ERROR: Failed to build profile from indices", args.refs)
+            print("ERROR: Failed to build profile", file=sys.stderr)
             sys.exit(1)
 
-    run_async_loop(iterations=args.iterations, validate_every=args.validate_every,
-                   profile_path=profile_path)
+    run_analysis_loop(iterations=args.iterations, validate_every=args.validate_every,
+                      profile_path=profile_path)
